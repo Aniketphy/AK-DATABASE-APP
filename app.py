@@ -417,108 +417,259 @@ class DataWarehouse:
         return profile_id
     
     def process_file(self, file_obj, metadata: Dict) -> Dict:
-        """Process uploaded file and merge into warehouse"""
+    """Process uploaded file and merge into warehouse"""
+    
+    result = {
+        'success': False,
+        'message': '',
+        'total_records': 0,
+        'profiles_created': 0,
+        'profiles_enriched': 0,
+        'invalid_mobiles': 0
+    }
+    
+    try:
+        # Check if file is empty first
+        if file_obj.size == 0:
+            result['message'] = "File is empty - skipping"
+            result['success'] = True  # Not an error, just skip
+            return result
         
-        result = {
-            'success': False,
-            'message': '',
-            'total_records': 0,
-            'profiles_created': 0,
-            'profiles_enriched': 0,
-            'invalid_mobiles': 0
-        }
+        # Read file with multiple fallback strategies for Excel files
+        df = None
         
-        try:
-            # Read file with encoding detection
-            if file_obj.name.endswith('.xls') or file_obj.name.endswith('.xlsx'):
-                df = pd.read_excel(file_obj)
-            else:
-                # Detect encoding for CSV
-                raw_data = file_obj.read(10000)
-                encoding = chardet.detect(raw_data)['encoding'] or 'utf-8'
-                file_obj.seek(0)
-                df = pd.read_csv(file_obj, encoding=encoding, on_bad_lines='skip')
-            
-            if df.empty:
-                result['message'] = "File is empty"
-                return result
-            
-            # Detect mobile column by examining data
-            mobile_col = None
-            for col in df.columns:
-                sample = df[col].dropna().head(20).astype(str)
-                if sample.str.match(r'^[0-9]{10}$').any() or sample.str.match(r'^[0-9]{12}$').any():
+        # For .xls files (old Excel format)
+        if file_obj.name.endswith('.xls'):
+            try:
+                # Try with xlrd engine first
+                df = pd.read_excel(file_obj, engine='xlrd')
+            except:
+                try:
+                    # Try with openpyxl (sometimes works)
+                    file_obj.seek(0)
+                    df = pd.read_excel(file_obj, engine='openpyxl')
+                except:
+                    try:
+                        # Try reading as CSV with different encodings
+                        file_obj.seek(0)
+                        content = file_obj.read()
+                        file_obj.seek(0)
+                        # Try UTF-8
+                        try:
+                            df = pd.read_csv(io.BytesIO(content), encoding='utf-8', on_bad_lines='skip')
+                        except:
+                            # Try latin-1
+                            df = pd.read_csv(io.BytesIO(content), encoding='latin-1', on_bad_lines='skip')
+                    except:
+                        pass
+        
+        # For .xlsx files
+        elif file_obj.name.endswith('.xlsx'):
+            try:
+                df = pd.read_excel(file_obj, engine='openpyxl')
+            except:
+                try:
+                    file_obj.seek(0)
+                    df = pd.read_excel(file_obj, engine='xlrd')
+                except:
+                    pass
+        
+        # For CSV files
+        else:
+            # Try different encodings
+            encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']
+            for encoding in encodings:
+                try:
+                    file_obj.seek(0)
+                    df = pd.read_csv(file_obj, encoding=encoding, on_bad_lines='skip')
+                    if df is not None and not df.empty:
+                        break
+                except:
+                    continue
+        
+        if df is None or df.empty:
+            result['message'] = "Could not read file or file is empty"
+            return result
+        
+        # Clean column names
+        df.columns = [str(col).strip() for col in df.columns]
+        
+        # Enhanced mobile column detection - check multiple strategies
+        mobile_col = None
+        
+        # Strategy 1: Check column names for mobile keywords
+        mobile_keywords = ['mobile', 'phone', 'contact', 'cell', 'mob', 'telephone', 
+                          'whatsapp', 'ph', 'mobile no', 'phone no', 'contact no']
+        
+        for col in df.columns:
+            col_lower = str(col).lower()
+            for keyword in mobile_keywords:
+                if keyword in col_lower:
                     mobile_col = col
                     break
-            
-            if not mobile_col:
-                result['message'] = "No mobile number column detected"
-                return result
-            
-            # Process each row
-            for _, row in df.iterrows():
-                result['total_records'] += 1
-                
-                mobile_raw = row[mobile_col]
-                mobile, is_valid = self.clean_mobile(mobile_raw)
-                
-                if not is_valid or not mobile:
-                    result['invalid_mobiles'] += 1
-                    continue
-                
-                # Build record dict - try common column names
-                record = {
-                    'mobile': mobile,
-                    'name': row.get('name') or row.get('Name') or row.get('NAME') or row.get('full_name') or '',
-                    'email': row.get('email') or row.get('Email') or row.get('EMAIL') or '',
-                    'address': row.get('address') or row.get('Address') or row.get('ADDRESS') or '',
-                    'city': row.get('city') or row.get('City') or row.get('CITY') or '',
-                    'pincode': str(row.get('pincode') or row.get('Pincode') or row.get('PINCODE') or ''),
-                    'bhk_preference': row.get('bhk') or row.get('BHK') or row.get('preference') or '',
-                    'budget_range': row.get('budget') or row.get('Budget') or row.get('price_range') or '',
-                    'date_collected': metadata.get('collection_date', datetime.now().strftime("%Y-%m-%d"))
-                }
-                
-                # Check if profile exists
-                cursor = self.conn.execute("SELECT profile_id FROM profiles WHERE mobile = ?", (mobile,))
-                existing = cursor.fetchone()
-                
-                if existing:
-                    # Enrich existing profile
-                    self.merge_profile(existing[0], record, file_obj.name, 'ACTUAL')
-                    result['profiles_enriched'] += 1
-                else:
-                    # Create new profile
-                    profile_id = self.create_profile(record, file_obj.name, 
-                                                     metadata.get('source_type', 'Unknown'),
-                                                     metadata.get('category', 'Let system decide'),
-                                                     'ACTUAL')
-                    if profile_id:
-                        result['profiles_created'] += 1
-            
-            result['success'] = True
-            result['message'] = f"Processed {result['total_records']} records"
-            
-            # Store import job
-            job_id = hashlib.md5(f"{file_obj.name}{datetime.now()}".encode()).hexdigest()[:8]
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            self.conn.execute("""
-                INSERT INTO import_jobs VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )
-            """, (job_id, file_obj.name, metadata.get('source_type'), metadata.get('collection_date'),
-                  metadata.get('category'), metadata.get('geographic_coverage'), metadata.get('quality_notes'),
-                  metadata.get('file_label'), 'COMPLETE', result['total_records'], result['total_records'],
-                  result['profiles_created'], result['profiles_enriched'], result['invalid_mobiles'],
-                  now, now))
-            
-            self.conn.commit()
-            
-        except Exception as e:
-            result['message'] = f"Error: {str(e)}"
+            if mobile_col:
+                break
         
-        return result
+        # Strategy 2: Check data patterns if no column name found
+        if not mobile_col:
+            for col in df.columns:
+                try:
+                    # Check first 50 non-null values
+                    sample = df[col].dropna().head(50).astype(str)
+                    # Look for 10-digit patterns
+                    if sample.str.match(r'^[0-9]{10}$').any():
+                        mobile_col = col
+                        break
+                    # Look for 12-digit patterns (with country code)
+                    if sample.str.match(r'^[0-9]{12}$').any():
+                        mobile_col = col
+                        break
+                    # Look for numbers with spaces/dashes
+                    if sample.str.replace(r'[\s\-\(\)]', '', regex=True).str.match(r'^[0-9]{10}$').any():
+                        mobile_col = col
+                        break
+                except:
+                    continue
+        
+        # Strategy 3: Check first row for mobile-like values
+        if not mobile_col and len(df) > 0:
+            for col in df.columns:
+                try:
+                    first_val = str(df[col].iloc[0])
+                    digits = ''.join(filter(str.isdigit, first_val))
+                    if len(digits) == 10 and digits[0] in '6789':
+                        mobile_col = col
+                        break
+                except:
+                    continue
+        
+        if not mobile_col:
+            # Log available columns for debugging
+            st.warning(f"Available columns in {file_obj.name}: {list(df.columns)}")
+            result['message'] = f"No mobile number column detected. Available columns: {list(df.columns)[:5]}"
+            return result
+        
+        # Process each row
+        for idx, row in df.iterrows():
+            result['total_records'] += 1
+            
+            mobile_raw = row[mobile_col]
+            mobile, is_valid = self.clean_mobile(mobile_raw)
+            
+            if not is_valid or not mobile:
+                result['invalid_mobiles'] += 1
+                continue
+            
+            # Build record dict - try to find name, email, address columns
+            name_col = None
+            email_col = None
+            address_col = None
+            city_col = None
+            
+            # Find name column
+            for col in df.columns:
+                col_lower = str(col).lower()
+                if 'name' in col_lower or 'full_name' in col_lower or 'customer' in col_lower:
+                    name_col = col
+                    break
+            
+            # Find email column
+            for col in df.columns:
+                col_lower = str(col).lower()
+                if 'email' in col_lower or 'mail' in col_lower:
+                    email_col = col
+                    break
+            
+            # Find address column
+            for col in df.columns:
+                col_lower = str(col).lower()
+                if 'address' in col_lower or 'addr' in col_lower or 'location' in col_lower:
+                    address_col = col
+                    break
+            
+            # Find city column
+            for col in df.columns:
+                col_lower = str(col).lower()
+                if col_lower == 'city' or col_lower == 'town' or col_lower == 'district':
+                    city_col = col
+                    break
+            
+            record = {
+                'mobile': mobile,
+                'name': row[name_col] if name_col and name_col in row else '',
+                'email': row[email_col] if email_col and email_col in row else '',
+                'address': row[address_col] if address_col and address_col in row else '',
+                'city': row[city_col] if city_col and city_col in row else '',
+                'pincode': '',
+                'bhk_preference': '',
+                'budget_range': '',
+                'date_collected': metadata.get('collection_date', datetime.now().strftime("%Y-%m-%d"))
+            }
+            
+            # Also check for any column that might contain these fields by value inspection
+            for col in df.columns:
+                if col not in [name_col, email_col, address_col, city_col, mobile_col]:
+                    try:
+                        val = str(row[col])
+                        # Check if looks like email
+                        if '@' in val and not record['email']:
+                            record['email'] = val
+                        # Check if looks like pincode (6 digits)
+                        elif len(val) == 6 and val.isdigit() and not record['pincode']:
+                            record['pincode'] = val
+                        # Check if looks like BHK
+                        elif 'bhk' in val.lower() and not record['bhk_preference']:
+                            record['bhk_preference'] = val
+                    except:
+                        pass
+            
+            # Clean up None values
+            for key in record:
+                if record[key] is None or pd.isna(record[key]):
+                    record[key] = ''
+                elif isinstance(record[key], float) and record[key] != record[key]:  # NaN check
+                    record[key] = ''
+            
+            # Check if profile exists
+            cursor = self.conn.execute("SELECT profile_id FROM profiles WHERE mobile = ?", (mobile,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                # Enrich existing profile
+                self.merge_profile(existing[0], record, file_obj.name, 'ACTUAL')
+                result['profiles_enriched'] += 1
+            else:
+                # Create new profile
+                profile_id = self.create_profile(record, file_obj.name, 
+                                                 metadata.get('source_type', 'Unknown'),
+                                                 metadata.get('category', 'Let system decide'),
+                                                 'ACTUAL')
+                if profile_id:
+                    result['profiles_created'] += 1
+        
+        result['success'] = True
+        result['message'] = f"Processed {result['total_records']} records"
+        
+        # Store import job
+        job_id = hashlib.md5(f"{file_obj.name}{datetime.now()}".encode()).hexdigest()[:8]
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        self.conn.execute("""
+            INSERT INTO import_jobs VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+        """, (job_id, file_obj.name, metadata.get('source_type'), metadata.get('collection_date'),
+              metadata.get('category'), metadata.get('geographic_coverage'), metadata.get('quality_notes'),
+              metadata.get('file_label'), 'COMPLETE', result['total_records'], result['total_records'],
+              result['profiles_created'], result['profiles_enriched'], result['invalid_mobiles'],
+              now, now))
+        
+        self.conn.commit()
+        
+    except Exception as e:
+        result['message'] = f"Error: {str(e)}"
+    
+    return result
     
     def search(self, query: str = None, filters: Dict = None, limit: int = 1000) -> pd.DataFrame:
         """Search profiles with filters"""
