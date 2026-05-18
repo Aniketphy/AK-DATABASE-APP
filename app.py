@@ -14,11 +14,25 @@ import base64
 from typing import Dict, List, Any, Optional, Tuple
 import warnings
 from collections import defaultdict
-import openai
 import openpyxl
 import xlrd
 from io import BytesIO
-import chardet
+
+# Optional imports with fallbacks
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    openai = None
+
+try:
+    import chardet
+    CHARDET_AVAILABLE = True
+except ImportError:
+    CHARDET_AVAILABLE = False
+    chardet = None
+
 warnings.filterwarnings('ignore')
 
 # Page configuration
@@ -90,7 +104,7 @@ class AIDataProcessor:
     
     def __init__(self, api_key: str = None):
         self.client = None
-        if api_key:
+        if api_key and OPENAI_AVAILABLE:
             try:
                 self.client = openai.OpenAI(api_key=api_key)
             except Exception as e:
@@ -110,7 +124,7 @@ class AIDataProcessor:
     
     def detect_columns_with_ai(self, df: pd.DataFrame, file_name: str, target_columns: List[str]) -> Dict[str, str]:
         """Use OpenAI to intelligently detect column mappings"""
-        if not self.client:
+        if not self.client or not OPENAI_AVAILABLE:
             return self.fallback_column_detection(df, target_columns)
         
         try:
@@ -261,14 +275,15 @@ Return ONLY the JSON mapping, no other text."""
                 pass
             
             try:
-                # Try different encoding
-                file_obj.seek(0)
-                result = chardet.detect(file_obj.read(10000))
-                encoding = result['encoding'] if result['encoding'] else 'latin1'
-                file_obj.seek(0)
-                df = pd.read_csv(file_obj, encoding=encoding, on_bad_lines='skip')
-                if not df.empty:
-                    return df
+                # Try different encoding with chardet if available
+                if CHARDET_AVAILABLE:
+                    file_obj.seek(0)
+                    result = chardet.detect(file_obj.read(10000))
+                    encoding = result['encoding'] if result['encoding'] else 'latin1'
+                    file_obj.seek(0)
+                    df = pd.read_csv(file_obj, encoding=encoding, on_bad_lines='skip')
+                    if not df.empty:
+                        return df
             except:
                 pass
         
@@ -504,6 +519,13 @@ def main():
     
     st.markdown('<div class="main-header">🤖 AI-Powered Real Estate Data Warehouse</div>', unsafe_allow_html=True)
     
+    # Show warnings for missing optional packages
+    if not OPENAI_AVAILABLE:
+        st.warning("⚠️ OpenAI package not installed. Install openai to enable AI column detection. Using fallback mode.")
+    
+    if not CHARDET_AVAILABLE:
+        st.info("ℹ️ Chardet not installed. Using default encoding detection.")
+    
     # Initialize warehouse
     warehouse = AIWarehouse()
     
@@ -511,20 +533,23 @@ def main():
     with st.sidebar:
         st.title("⚙️ Configuration")
         
-        api_key = st.text_input("OpenAI API Key", type="password", 
-                                help="Enter your OpenAI API key for AI-powered column detection")
-        
-        if api_key:
-            st.session_state.openai_api_key = api_key
-            st.success("✅ OpenAI Ready!")
-        
-        # Model selection
-        if api_key:
-            st.session_state.openai_model = st.selectbox(
-                "OpenAI Model",
-                ["gpt-4", "gpt-4-turbo-preview", "gpt-3.5-turbo"],
-                index=2  # Default to gpt-3.5-turbo for cost efficiency
-            )
+        if OPENAI_AVAILABLE:
+            api_key = st.text_input("OpenAI API Key (Optional)", type="password", 
+                                    help="Enter your OpenAI API key for AI-powered column detection")
+            
+            if api_key:
+                st.session_state.openai_api_key = api_key
+                st.success("✅ OpenAI Ready!")
+            
+            # Model selection
+            if api_key:
+                st.session_state.openai_model = st.selectbox(
+                    "OpenAI Model",
+                    ["gpt-4", "gpt-4-turbo-preview", "gpt-3.5-turbo"],
+                    index=2  # Default to gpt-3.5-turbo for cost efficiency
+                )
+        else:
+            st.info("🤖 Install openai package to enable AI column detection")
         
         st.markdown("---")
         st.title("📊 Navigation")
@@ -724,14 +749,16 @@ def dynamic_query_page(warehouse: AIWarehouse):
                 
                 # Export option
                 st.markdown("---")
-                if st.button("📥 Export Results to CSV"):
-                    csv = results_df.to_csv(index=False).encode()
-                    st.download_button(
-                        "Download CSV",
-                        csv,
-                        f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        "text/csv"
-                    )
+                export_col1, export_col2 = st.columns(2)
+                with export_col1:
+                    if st.button("📥 Export Results to CSV"):
+                        csv = results_df.to_csv(index=False).encode()
+                        st.download_button(
+                            "Download CSV",
+                            csv,
+                            f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            "text/csv"
+                        )
             else:
                 st.info("No records found matching your criteria")
 
@@ -884,18 +911,20 @@ def system_info_page(warehouse: AIWarehouse):
     - **Excel**: .xlsx (openpyxl), .xls (xlrd)
     - **CSV**: UTF-8, Latin-1, ISO-8859-1 encodings
     
-    ### OpenAI Integration
-    
-    - Uses GPT models for intelligent column detection
-    - Falls back to rule-based detection if API fails
-    - No data is sent to OpenAI (only column names and sample data types)
-    
-    ### Data Privacy
-    
-    - All processing happens in memory
-    - No data is stored permanently
-    - API keys are not saved
+    ### Package Status
     """)
+    
+    # Show package status
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Installed Packages:**")
+        st.markdown(f"- OpenAI: {'✅' if OPENAI_AVAILABLE else '❌'}")
+        st.markdown(f"- Chardet: {'✅' if CHARDET_AVAILABLE else '❌'}")
+    with col2:
+        st.markdown("**Core Packages:**")
+        st.markdown("- Pandas: ✅")
+        st.markdown("- Plotly: ✅")
+        st.markdown("- OpenPyXL: ✅")
 
 if __name__ == "__main__":
     main()
