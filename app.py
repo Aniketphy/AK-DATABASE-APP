@@ -18,6 +18,7 @@ import anthropic
 import openpyxl
 import xlrd
 from io import BytesIO
+import chardet
 warnings.filterwarnings('ignore')
 
 # Page configuration
@@ -81,6 +82,8 @@ if 'claude_client' not in st.session_state:
     st.session_state.claude_client = None
 if 'processing_queue' not in st.session_state:
     st.session_state.processing_queue = []
+if 'failed_files' not in st.session_state:
+    st.session_state.failed_files = []
 
 class AIDataProcessor:
     """AI-powered data processing with Claude API"""
@@ -90,9 +93,20 @@ class AIDataProcessor:
         if api_key:
             try:
                 self.client = anthropic.Anthropic(api_key=api_key)
-                st.success("🤖 AI Assistant Ready!")
             except Exception as e:
-                st.warning(f"AI setup: {str(e)}")
+                pass
+    
+    def safe_convert_to_string(self, value: Any) -> str:
+        """Safely convert any value to string without lower() errors"""
+        if pd.isna(value) or value is None:
+            return ""
+        try:
+            # Handle integers, floats, and other types
+            if isinstance(value, (int, float)):
+                return str(int(value)) if value == int(value) else str(value)
+            return str(value).strip()
+        except:
+            return ""
     
     def detect_columns_with_ai(self, df: pd.DataFrame, file_name: str, target_columns: List[str]) -> Dict[str, str]:
         """Use Claude AI to intelligently detect column mappings"""
@@ -100,8 +114,20 @@ class AIDataProcessor:
             return self.fallback_column_detection(df, target_columns)
         
         try:
-            # Prepare sample data for AI
-            sample_data = df.head(10).to_dict('records')
+            # Prepare sample data safely
+            sample_data = []
+            for _, row in df.head(5).iterrows():
+                row_dict = {}
+                for col in df.columns:
+                    value = row[col]
+                    if pd.isna(value):
+                        row_dict[col] = None
+                    elif isinstance(value, (int, float)):
+                        row_dict[col] = str(int(value)) if value == int(value) else str(value)
+                    else:
+                        row_dict[col] = str(value)[:100]  # Limit string length
+                sample_data.append(row_dict)
+            
             columns_info = {col: str(df[col].dtype) for col in df.columns}
             
             # Create prompt for Claude
@@ -112,8 +138,8 @@ File Name: {file_name}
 Available columns in the file:
 {json.dumps(columns_info, indent=2)}
 
-Sample data (first 5 rows):
-{json.dumps(sample_data[:5], indent=2, default=str)}
+Sample data (first 3 rows):
+{json.dumps(sample_data[:3], indent=2, default=str)}
 
 Target columns to map:
 {json.dumps(target_columns, indent=2)}
@@ -121,11 +147,15 @@ Target columns to map:
 Please analyze the column names and sample data to determine which existing columns correspond to each target column.
 Return a JSON object mapping target columns to actual column names in the file.
 If a target column cannot be mapped, map it to null.
-Consider:
-1. Column name similarity (case-insensitive, partial matches)
-2. Data patterns (phone numbers, emails, names, etc.)
-3. Common variations (mobile/phone/contact, name/full_name, etc.)
-4. Data types and formats
+
+Important rules:
+1. For 'contact' column: Look for columns containing phone numbers (10-12 digits), or named: mobile, phone, contact, cell, telephone
+2. For 'name' column: Look for columns with names, full names, customer names
+3. For 'email' column: Look for columns with @ symbol or named email, e-mail
+4. For 'address' column: Look for address, location, area columns
+5. For 'city' column: Look for city, town, district columns
+6. For 'source' column: Look for source, lead source columns
+7. For 'category' column: Look for category, type, classification columns
 
 Return ONLY the JSON mapping, no other text."""
 
@@ -141,7 +171,6 @@ Return ONLY the JSON mapping, no other text."""
             
             # Parse AI response
             response_text = message.content[0].text
-            # Extract JSON from response
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
                 mapping = json.loads(json_match.group())
@@ -150,7 +179,6 @@ Return ONLY the JSON mapping, no other text."""
                 return self.fallback_column_detection(df, target_columns)
                 
         except Exception as e:
-            st.warning(f"AI detection failed: {str(e)}. Using fallback method.")
             return self.fallback_column_detection(df, target_columns)
     
     def fallback_column_detection(self, df: pd.DataFrame, target_columns: List[str]) -> Dict[str, str]:
@@ -160,8 +188,8 @@ Return ONLY the JSON mapping, no other text."""
         
         # Comprehensive mapping rules
         mapping_rules = {
-            'contact': ['contact', 'mobile', 'phone', 'cell', 'mob', 'telephone', 'whatsapp', 'ph', 'phone number', 'contact number'],
-            'name': ['name', 'full name', 'customer name', 'client name', 'party name', 'buyer name', 'seller name', 'lead name'],
+            'contact': ['contact', 'mobile', 'phone', 'cell', 'mob', 'telephone', 'whatsapp', 'ph', 'phone number', 'contact number', 'mobile number'],
+            'name': ['name', 'full name', 'customer name', 'client name', 'party name', 'buyer name', 'seller name', 'lead name', 'campaign_name'],
             'email': ['email', 'e-mail', 'mail', 'email id', 'email address', 'mail id'],
             'address': ['address', 'addr', 'location', 'locality', 'area', 'street', 'full address', 'property address'],
             'city': ['city', 'town', 'district', 'location city'],
@@ -184,141 +212,122 @@ Return ONLY the JSON mapping, no other text."""
             # If not found, try data pattern detection
             if target not in mapping and target == 'contact':
                 for col in df.columns:
-                    sample = df[col].head(20).astype(str)
-                    # Check for phone number pattern
-                    if sample.str.match(r'^[0-9]{10}$').any() or sample.str.match(r'^[0-9]{12}$').any():
-                        mapping[target] = col
-                        break
+                    try:
+                        # Check first 20 non-null values
+                        sample = df[col].dropna().head(20).astype(str)
+                        # Check for phone number pattern
+                        if sample.str.match(r'^[0-9]{10}$').any() or sample.str.match(r'^[0-9]{12}$').any():
+                            mapping[target] = col
+                            break
+                    except:
+                        continue
             
-            # If still not found, set to null
+            # If still not found, set to None
             if target not in mapping:
                 mapping[target] = None
         
         return mapping
     
-    def fix_excel_engine(self, file_obj) -> pd.DataFrame:
-        """Intelligently read Excel files with correct engine"""
-        try:
-            # Try reading with default engine
-            if file_obj.name.endswith('.xls'):
-                # For older .xls files
-                df = pd.read_excel(file_obj, engine='xlrd')
-            else:
-                # For .xlsx files
-                df = pd.read_excel(file_obj, engine='openpyxl')
-            return df
-        except Exception as e:
+    def read_file_with_fallback(self, file_obj) -> Optional[pd.DataFrame]:
+        """Intelligently read Excel/CSV files with multiple fallback strategies"""
+        
+        # For old .xls files
+        if file_obj.name.endswith('.xls'):
             try:
-                # Try alternative engine
-                if file_obj.name.endswith('.xls'):
-                    df = pd.read_excel(file_obj, engine='openpyxl')
-                else:
-                    df = pd.read_excel(file_obj, engine='xlrd')
-                return df
+                # Try with xlrd engine first
+                df = pd.read_excel(file_obj, engine='xlrd')
+                if not df.empty:
+                    return df
             except:
-                # If both fail, try reading with raw data
+                pass
+            
+            try:
+                # Try reading with openpyxl
                 file_obj.seek(0)
-                df = pd.read_excel(file_obj, engine=None)
-                return df
+                df = pd.read_excel(file_obj, engine='openpyxl')
+                if not df.empty:
+                    return df
+            except:
+                pass
+            
+            try:
+                # Try reading as CSV
+                file_obj.seek(0)
+                df = pd.read_csv(file_obj, encoding='utf-8', on_bad_lines='skip')
+                if not df.empty:
+                    return df
+            except:
+                pass
+            
+            try:
+                # Try different encoding
+                file_obj.seek(0)
+                result = chardet.detect(file_obj.read(10000))
+                encoding = result['encoding'] if result['encoding'] else 'latin1'
+                file_obj.seek(0)
+                df = pd.read_csv(file_obj, encoding=encoding, on_bad_lines='skip')
+                if not df.empty:
+                    return df
+            except:
+                pass
+        
+        # For .xlsx files
+        elif file_obj.name.endswith('.xlsx'):
+            try:
+                df = pd.read_excel(file_obj, engine='openpyxl')
+                if not df.empty:
+                    return df
+            except:
+                pass
+            
+            try:
+                file_obj.seek(0)
+                df = pd.read_excel(file_obj, engine='xlrd')
+                if not df.empty:
+                    return df
+            except:
+                pass
+        
+        # For CSV files
+        else:
+            encodings = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']
+            for encoding in encodings:
+                try:
+                    file_obj.seek(0)
+                    df = pd.read_csv(file_obj, encoding=encoding, on_bad_lines='skip')
+                    if not df.empty:
+                        return df
+                except:
+                    continue
+        
+        return None
 
 class AIWarehouse:
     """AI-powered data warehouse"""
     
     def __init__(self):
-        self.ai_processor = AIDataProcessor(st.session_state.get('claude_api_key'))
+        api_key = st.session_state.get('claude_api_key')
+        self.ai_processor = AIDataProcessor(api_key)
         self.data = st.session_state.data_warehouse
-        self.primary_key = 'contact'  # Standardized primary key
+        self.primary_key = 'contact'
     
-    def process_file_with_ai(self, file_obj, metadata: Dict) -> Tuple[bool, str, Dict]:
-        """Process file with AI-powered column detection"""
-        try:
-            # First, fix Excel engine issues
-            if file_obj.name.endswith(('.xls', '.xlsx')):
-                df = self.ai_processor.fix_excel_engine(file_obj)
-            else:
-                df = pd.read_csv(file_obj)
-            
-            if df.empty:
-                return False, "File is empty", {}
-            
-            # Target columns we want to map
-            target_columns = ['contact', 'name', 'email', 'address', 'city', 'state', 'pincode', 'source', 'category']
-            
-            # Use AI to detect column mappings
-            column_mapping = self.ai_processor.detect_columns_with_ai(df, file_obj.name, target_columns)
-            
-            # Store mapping for this file
-            st.session_state.column_mappings[file_obj.name] = column_mapping
-            
-            # Rename columns based on mapping
-            rename_dict = {v: k for k, v in column_mapping.items() if v is not None and v in df.columns}
-            if rename_dict:
-                df = df.rename(columns=rename_dict)
-            
-            # Ensure all target columns exist
-            for col in target_columns:
-                if col not in df.columns:
-                    df[col] = ""
-            
-            # Clean contact numbers (standardize to 10 digits)
-            if 'contact' in df.columns:
-                df['contact'] = df['contact'].astype(str).apply(self.clean_contact)
-                df['contact_valid'] = df['contact'].str.match(r'^[0-9]{10}$')
-            
-            # Add metadata
-            df['_source_file'] = file_obj.name
-            df['_upload_date'] = metadata.get('upload_date', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            df['_source_type'] = metadata.get('source_type', 'Unknown')
-            df['_category'] = metadata.get('category', 'Uncategorized')
-            
-            # Remove duplicates based on contact
-            before_count = len(df)
-            df = df.drop_duplicates(subset=['contact'], keep='first')
-            after_count = len(df)
-            
-            # Merge with existing data
-            if st.session_state.data_warehouse.empty:
-                st.session_state.data_warehouse = df
-            else:
-                # Use contact as key for merging
-                st.session_state.data_warehouse = pd.merge(
-                    st.session_state.data_warehouse,
-                    df,
-                    on=['contact'],
-                    how='outer',
-                    suffixes=('', '_new')
-                )
-                
-                # Merge additional fields
-                for col in ['name', 'email', 'address', 'city', 'state', 'pincode']:
-                    if f"{col}_new" in st.session_state.data_warehouse.columns:
-                        st.session_state.data_warehouse[col] = st.session_state.data_warehouse[col].fillna(
-                            st.session_state.data_warehouse[f"{col}_new"]
-                        )
-                        st.session_state.data_warehouse.drop(columns=[f"{col}_new"], inplace=True)
-            
-            file_info = {
-                'file_name': file_obj.name,
-                'records_added': after_count,
-                'duplicates_removed': before_count - after_count,
-                'column_mapping': column_mapping,
-                'upload_date': metadata.get('upload_date', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                'source_type': metadata.get('source_type', 'Unknown'),
-                'category': metadata.get('category', 'Uncategorized')
-            }
-            
-            return True, f"Successfully added {after_count} records", file_info
-            
-        except Exception as e:
-            return False, f"Error: {str(e)}", {}
-    
-    def clean_contact(self, contact: str) -> str:
+    def clean_contact(self, contact: Any) -> str:
         """Clean contact number to standard 10-digit format"""
-        if pd.isna(contact) or contact == "":
+        # Convert to string safely
+        if pd.isna(contact) or contact is None:
+            return ""
+        
+        # Handle different types
+        try:
+            if isinstance(contact, (int, float)):
+                contact_str = str(int(contact)) if contact == int(contact) else str(contact)
+            else:
+                contact_str = str(contact).strip()
+        except:
             return ""
         
         # Extract digits only
-        digits = re.sub(r'\D', '', str(contact))
+        digits = re.sub(r'\D', '', contact_str)
         
         # Standardize to 10 digits
         if len(digits) == 10:
@@ -329,8 +338,104 @@ class AIWarehouse:
             return digits[2:]
         elif len(digits) == 13 and digits.startswith('091'):
             return digits[3:]
+        elif len(digits) > 10:
+            # Take last 10 digits
+            return digits[-10:]
         else:
             return ""
+    
+    def process_file(self, file_obj, metadata: Dict) -> Tuple[bool, str, Dict]:
+        """Process a single file with comprehensive error handling"""
+        try:
+            # First check if file is empty
+            if file_obj.size == 0:
+                return False, "File is empty", {}
+            
+            # Read file with fallback strategies
+            df = self.ai_processor.read_file_with_fallback(file_obj)
+            
+            if df is None or df.empty:
+                return False, "Could not read file or file is empty", {}
+            
+            # Clean column names (remove extra spaces)
+            df.columns = df.columns.str.strip()
+            
+            # Target columns
+            target_columns = ['contact', 'name', 'email', 'address', 'city', 'state', 'pincode', 'source', 'category']
+            
+            # Detect column mappings
+            column_mapping = self.ai_processor.detect_columns_with_ai(df, file_obj.name, target_columns)
+            
+            # Store mapping
+            st.session_state.column_mappings[file_obj.name] = column_mapping
+            
+            # Apply renaming
+            rename_dict = {}
+            for target, source in column_mapping.items():
+                if source and source in df.columns and source not in rename_dict:
+                    rename_dict[source] = target
+            
+            if rename_dict:
+                df = df.rename(columns=rename_dict)
+            
+            # Ensure all target columns exist
+            for col in target_columns:
+                if col not in df.columns:
+                    df[col] = ""
+            
+            # Clean contact numbers safely
+            if 'contact' in df.columns:
+                df['contact'] = df['contact'].apply(lambda x: self.clean_contact(x))
+                df['contact_valid'] = df['contact'].apply(lambda x: len(x) == 10 if x else False)
+                # Remove rows with invalid contacts
+                df = df[df['contact'] != ""]
+            
+            if df.empty:
+                return False, "No valid contact numbers found", {}
+            
+            # Add metadata
+            df['_source_file'] = file_obj.name
+            df['_upload_date'] = metadata.get('upload_date', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            df['_source_type'] = metadata.get('source_type', 'Unknown')
+            df['_category'] = metadata.get('category', 'Uncategorized')
+            
+            # Remove duplicates within the same file
+            df = df.drop_duplicates(subset=['contact'], keep='first')
+            
+            # Merge with existing warehouse
+            if st.session_state.data_warehouse.empty:
+                st.session_state.data_warehouse = df
+            else:
+                # Get existing contacts
+                existing_contacts = set(st.session_state.data_warehouse['contact'].tolist())
+                
+                # Only add new records (not existing in warehouse)
+                new_records = df[~df['contact'].isin(existing_contacts)]
+                
+                if not new_records.empty:
+                    st.session_state.data_warehouse = pd.concat(
+                        [st.session_state.data_warehouse, new_records], 
+                        ignore_index=True
+                    )
+                
+                records_added = len(new_records)
+                records_skipped = len(df) - records_added
+            }
+            
+            file_info = {
+                'file_name': file_obj.name,
+                'records_added': len(df) if st.session_state.data_warehouse.empty else records_added,
+                'records_skipped': 0 if st.session_state.data_warehouse.empty else records_skipped,
+                'column_mapping': column_mapping,
+                'upload_date': metadata.get('upload_date', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                'source_type': metadata.get('source_type', 'Unknown'),
+                'category': metadata.get('category', 'Uncategorized')
+            }
+            
+            return True, f"Successfully added {file_info['records_added']} records", file_info
+            
+        except Exception as e:
+            return False, f"Error: {str(e)}", {}
     
     def dynamic_query(self, conditions: Dict) -> pd.DataFrame:
         """Execute dynamic query"""
@@ -342,23 +447,28 @@ class AIWarehouse:
         # Apply filters
         for field, value in conditions.items():
             if field == 'search_text' and value:
-                # Search across text fields
                 search_mask = pd.Series([False] * len(df))
                 text_cols = ['name', 'email', 'address', 'city', 'contact']
                 for col in text_cols:
                     if col in df.columns:
-                        search_mask |= df[col].astype(str).str.lower().str.contains(value.lower(), na=False)
+                        try:
+                            search_mask |= df[col].astype(str).str.lower().str.contains(value.lower(), na=False)
+                        except:
+                            continue
                 df = df[search_mask]
             
             elif field in df.columns and value and value != 'All':
-                df = df[df[field] == value]
+                try:
+                    df = df[df[field] == value]
+                except:
+                    continue
             
             elif field == 'contact' and value:
                 contact_clean = self.clean_contact(value)
                 if contact_clean:
                     df = df[df['contact'] == contact_clean]
         
-        # Remove internal columns
+        # Remove internal columns for display
         display_cols = [col for col in df.columns if not col.startswith('_')]
         return df[display_cols] if display_cols else df
     
@@ -376,13 +486,14 @@ class AIWarehouse:
             'valid_contacts': df['contact_valid'].sum() if 'contact_valid' in df.columns else 0
         }
         
-        # Source distribution
         if '_source_type' in df.columns:
             stats['source_distribution'] = df['_source_type'].value_counts().to_dict()
         
-        # Category distribution
         if '_category' in df.columns:
             stats['category_distribution'] = df['_category'].value_counts().to_dict()
+        
+        if 'city' in df.columns:
+            stats['city_distribution'] = df['city'].value_counts().head(10).to_dict()
         
         return stats
 
@@ -398,15 +509,12 @@ def main():
     with st.sidebar:
         st.title("⚙️ Configuration")
         
-        # Claude API Key input
-        api_key = st.text_input("Claude API Key", type="password", 
-                                help="Enter your Claude API key for AI-powered column detection")
+        api_key = st.text_input("Claude API Key (Optional)", type="password", 
+                                help="Enter your Claude API key for enhanced AI column detection")
         
         if api_key:
             st.session_state.claude_api_key = api_key
-            if not st.session_state.get('claude_client'):
-                st.session_state.claude_client = anthropic.Anthropic(api_key=api_key)
-                st.success("✅ AI Assistant Configured!")
+            st.success("✅ AI Ready!")
         
         st.markdown("---")
         st.title("📊 Navigation")
@@ -414,7 +522,7 @@ def main():
         page = st.radio(
             "Select Module",
             ["📤 Upload Files", "🔍 Dynamic Query", "📈 Analytics Dashboard", 
-             "📁 File Management", "🤖 AI Column Mapping", "ℹ️ System Info"],
+             "📁 File Management", "🤖 Column Mappings", "ℹ️ System Info"],
             index=0
         )
         
@@ -435,21 +543,21 @@ def main():
         analytics_dashboard_page(warehouse)
     elif page == "📁 File Management":
         file_management_page(warehouse)
-    elif page == "🤖 AI Column Mapping":
-        ai_mapping_page(warehouse)
+    elif page == "🤖 Column Mappings":
+        mappings_page(warehouse)
     elif page == "ℹ️ System Info":
         system_info_page(warehouse)
 
 def upload_files_page(warehouse: AIWarehouse):
-    """Handle file uploads with AI processing"""
-    st.header("📤 Upload Files with AI Processing")
+    """Handle file uploads"""
+    st.header("📤 Upload Files")
     
     st.info("""
-    🤖 **AI-Powered Processing:**
-    - Automatically detects column mappings using Claude AI
-    - Handles various Excel formats (.xls, .xlsx, .csv)
-    - Standardizes contact numbers to 10 digits
-    - Uses contact number as primary key for deduplication
+    🤖 **Features:**
+    - Automatically detects contact numbers, names, emails, addresses
+    - Handles Excel (.xlsx, .xls) and CSV files
+    - Uses contact number as unique identifier
+    - Prevents duplicate records
     """)
     
     with st.form("upload_form"):
@@ -457,7 +565,7 @@ def upload_files_page(warehouse: AIWarehouse):
         
         with col1:
             source_type = st.selectbox(
-                "Source Type",
+                "Default Source Type",
                 ["General", "MSEB", "Facebook Leads", "Property Portal", 
                  "Agent List", "School Data", "Doctor List", "Police Records",
                  "Broker List", "Expo Visitors", "Sales Data", "Other"]
@@ -465,7 +573,7 @@ def upload_files_page(warehouse: AIWarehouse):
         
         with col2:
             category = st.selectbox(
-                "Category",
+                "Default Category",
                 ["Real Estate Trade", "Property Seeker", "Non-Real Estate", "General"]
             )
         
@@ -473,16 +581,16 @@ def upload_files_page(warehouse: AIWarehouse):
             "Choose Files (Excel or CSV)",
             type=['xlsx', 'xls', 'csv'],
             accept_multiple_files=True,
-            help="Upload any number of files. AI will automatically detect column structures."
+            help="Upload multiple files. System will auto-detect columns and use contact numbers as unique keys."
         )
         
-        submitted = st.form_submit_button("🚀 Process with AI", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("🚀 Process Files", type="primary", use_container_width=True)
         
         if submitted and uploaded_files:
-            process_files_with_ai(warehouse, uploaded_files, source_type, category)
+            process_files(warehouse, uploaded_files, source_type, category)
 
-def process_files_with_ai(warehouse: AIWarehouse, files, source_type, category):
-    """Process files using AI"""
+def process_files(warehouse: AIWarehouse, files, source_type, category):
+    """Process multiple files"""
     progress_bar = st.progress(0)
     status_text = st.empty()
     results_container = st.container()
@@ -490,9 +598,10 @@ def process_files_with_ai(warehouse: AIWarehouse, files, source_type, category):
     success_count = 0
     error_count = 0
     total_records = 0
+    failed_files = []
     
     for idx, file in enumerate(files):
-        status_text.text(f"🤖 AI Processing: {file.name}... ({idx+1}/{len(files)})")
+        status_text.text(f"Processing: {file.name}... ({idx+1}/{len(files)})")
         
         metadata = {
             'upload_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -500,85 +609,96 @@ def process_files_with_ai(warehouse: AIWarehouse, files, source_type, category):
             'category': category
         }
         
-        success, message, file_info = warehouse.process_file_with_ai(file, metadata)
+        success, message, file_info = warehouse.process_file(file, metadata)
         
         if success:
             success_count += 1
             total_records += file_info.get('records_added', 0)
             with results_container:
                 st.success(f"✅ {file.name}: {message}")
-                if 'column_mapping' in file_info:
-                    st.caption(f"📋 AI Mapping: {file_info['column_mapping']}")
+                
+                # Show column mapping if available
+                if 'column_mapping' in file_info and file_info['column_mapping']:
+                    mapping_summary = {k: v for k, v in file_info['column_mapping'].items() if v}
+                    if mapping_summary:
+                        st.caption(f"📋 Mapped: {mapping_summary}")
+            
+            # Store metadata
+            st.session_state.file_metadata.append(file_info)
         else:
             error_count += 1
+            failed_files.append(file.name)
             with results_container:
                 st.error(f"❌ {file.name}: {message}")
         
         progress_bar.progress((idx + 1) / len(files))
     
-    status_text.text("✅ AI Processing Complete!")
+    status_text.text("✅ Processing Complete!")
     
     # Summary
     st.markdown("---")
     st.subheader("📊 Processing Summary")
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Files Processed", f"{success_count}/{len(files)}")
     with col2:
-        st.metric("Total Records Added", f"{total_records:,}")
+        st.metric("Files Failed", f"{error_count}")
     with col3:
+        st.metric("Total Records Added", f"{total_records:,}")
+    with col4:
         st.metric("Primary Key", "Contact Number")
+    
+    if failed_files:
+        st.warning(f"⚠️ Failed files: {', '.join(failed_files)}")
     
     if success_count > 0:
         st.balloons()
-        st.info("💡 Tip: Check the 'AI Column Mapping' page to see how AI mapped columns for each file")
+        st.info("💡 Go to 'Column Mappings' page to see how columns were detected")
 
 def dynamic_query_page(warehouse: AIWarehouse):
     """Dynamic query interface"""
-    st.header("🔍 Dynamic Query Builder")
+    st.header("🔍 Dynamic Query")
     
     if st.session_state.data_warehouse.empty:
         st.warning("No data available. Please upload files first.")
         return
     
-    st.markdown("### Query Your Data Warehouse")
-    
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     
     with col1:
-        search_text = st.text_input("🔍 Search Any Field", placeholder="Name, email, address...")
+        search_text = st.text_input("🔍 Search Any Field", placeholder="Name, email, city, address...")
     
     with col2:
+        contact_search = st.text_input("📱 Specific Contact Number", placeholder="Enter 10-digit number")
+    
+    col3, col4 = st.columns(2)
+    
+    with col3:
         if '_source_type' in st.session_state.data_warehouse.columns:
             sources = ['All'] + sorted(st.session_state.data_warehouse['_source_type'].unique().tolist())
             source_filter = st.selectbox("Filter by Source", sources)
         else:
             source_filter = "All"
     
-    with col3:
+    with col4:
         if '_category' in st.session_state.data_warehouse.columns:
             categories = ['All'] + sorted(st.session_state.data_warehouse['_category'].unique().tolist())
             category_filter = st.selectbox("Filter by Category", categories)
         else:
             category_filter = "All"
     
-    # Specific contact search
-    st.markdown("---")
-    contact_search = st.text_input("📱 Search Specific Contact Number", placeholder="Enter 10-digit contact number")
-    
-    # Execute query
     if st.button("🔍 Execute Query", type="primary", use_container_width=True):
         conditions = {}
         
         if search_text:
             conditions['search_text'] = search_text
+        if contact_search:
+            conditions['contact'] = contact_search
         if source_filter != "All":
             conditions['_source_type'] = source_filter
         if category_filter != "All":
             conditions['_category'] = category_filter
-        if contact_search:
-            conditions['contact'] = contact_search
         
         with st.spinner("Searching..."):
             results_df = warehouse.dynamic_query(conditions)
@@ -586,30 +706,22 @@ def dynamic_query_page(warehouse: AIWarehouse):
             st.markdown(f"### 📊 Results: {len(results_df)} records found")
             
             if not results_df.empty:
-                # Display results
+                # Select columns to display
                 display_cols = ['contact', 'name', 'email', 'city', '_source_type', '_category']
                 available_cols = [col for col in display_cols if col in results_df.columns]
                 
                 st.dataframe(results_df[available_cols], use_container_width=True, height=400)
                 
-                # Export
+                # Export option
                 st.markdown("---")
-                col1, col2 = st.columns(2)
-                with col1:
-                    export_format = st.selectbox("Export Format", ["CSV", "Excel"])
-                with col2:
-                    export_name = st.text_input("Filename", value=f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-                
-                if st.button("📥 Download Results"):
-                    if export_format == "CSV":
-                        csv = results_df.to_csv(index=False).encode()
-                        st.download_button("Download CSV", csv, f"{export_name}.csv", "text/csv")
-                    else:
-                        output = io.BytesIO()
-                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                            results_df.to_excel(writer, sheet_name='Results', index=False)
-                        st.download_button("Download Excel", output.getvalue(), f"{export_name}.xlsx", 
-                                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                if st.button("📥 Export Results to CSV"):
+                    csv = results_df.to_csv(index=False).encode()
+                    st.download_button(
+                        "Download CSV",
+                        csv,
+                        f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        "text/csv"
+                    )
             else:
                 st.info("No records found matching your criteria")
 
@@ -628,61 +740,72 @@ def analytics_dashboard_page(warehouse: AIWarehouse):
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Total Records", f"{stats['total_records']:,}")
+        st.metric("Total Records", f"{stats.get('total_records', 0):,}")
     with col2:
-        st.metric("Unique Contacts", f"{stats['unique_contacts']:,}")
+        st.metric("Unique Contacts", f"{stats.get('unique_contacts', 0):,}")
     with col3:
-        st.metric("Valid Contacts", f"{stats['valid_contacts']:,}")
+        st.metric("Valid Contacts", f"{stats.get('valid_contacts', 0):,}")
     with col4:
-        st.metric("Files Uploaded", f"{stats['total_files']}")
+        st.metric("Files Uploaded", f"{stats.get('total_files', 0)}")
     
     st.markdown("---")
     
     # Visualizations
-    tab1, tab2 = st.tabs(["📊 Distributions", "📈 Data Overview"])
+    tab1, tab2, tab3 = st.tabs(["📊 Source Distribution", "🏷️ Category Distribution", "📍 Top Cities"])
     
     with tab1:
-        col_a, col_b = st.columns(2)
-        
-        with col_a:
-            if 'source_distribution' in stats and stats['source_distribution']:
-                source_df = pd.DataFrame(list(stats['source_distribution'].items()), 
-                                        columns=['Source', 'Count'])
-                fig = px.pie(source_df, values='Count', names='Source', title='Records by Source', hole=0.3)
-                st.plotly_chart(fig, use_container_width=True)
-        
-        with col_b:
-            if 'category_distribution' in stats and stats['category_distribution']:
-                cat_df = pd.DataFrame(list(stats['category_distribution'].items()),
-                                     columns=['Category', 'Count'])
-                fig = px.bar(cat_df, x='Category', y='Count', title='Records by Category', color='Count')
-                st.plotly_chart(fig, use_container_width=True)
+        if 'source_distribution' in stats and stats['source_distribution']:
+            source_df = pd.DataFrame(list(stats['source_distribution'].items()), 
+                                    columns=['Source', 'Count'])
+            fig = px.pie(source_df, values='Count', names='Source', title='Records by Source', hole=0.3)
+            fig.update_layout(height=500)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No source distribution data available")
     
     with tab2:
-        # Top cities
-        if 'city' in df.columns:
-            city_counts = df['city'].value_counts().head(10)
-            fig = px.bar(x=city_counts.values, y=city_counts.index, orientation='h',
-                        title='Top 10 Cities', labels={'x': 'Count', 'y': 'City'})
+        if 'category_distribution' in stats and stats['category_distribution']:
+            cat_df = pd.DataFrame(list(stats['category_distribution'].items()),
+                                 columns=['Category', 'Count'])
+            fig = px.bar(cat_df, x='Category', y='Count', title='Records by Category', 
+                        color='Count', color_continuous_scale='Viridis')
+            fig.update_layout(height=500)
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No category distribution data available")
+    
+    with tab3:
+        if 'city' in df.columns:
+            city_counts = df['city'].value_counts().head(15)
+            if not city_counts.empty:
+                fig = px.bar(x=city_counts.values, y=city_counts.index, orientation='h',
+                            title='Top 15 Cities', labels={'x': 'Count', 'y': 'City'},
+                            color=city_counts.values, color_continuous_scale='Plasma')
+                fig.update_layout(height=500)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No city data available")
+        else:
+            st.info("City column not found in data")
 
-def ai_mapping_page(warehouse: AIWarehouse):
-    """Show AI column mappings"""
-    st.header("🤖 AI Column Mapping History")
+def mappings_page(warehouse: AIWarehouse):
+    """Show column mappings"""
+    st.header("🤖 Column Mappings")
     
     if not st.session_state.column_mappings:
-        st.info("No files processed yet. Upload files to see AI column mappings.")
+        st.info("No files processed yet. Upload files to see column mappings.")
         return
     
-    st.subheader("How AI Mapped Your Files")
+    st.subheader("How Columns Were Mapped")
     
     for file_name, mapping in st.session_state.column_mappings.items():
         with st.expander(f"📄 {file_name}"):
-            st.json(mapping)
-            
-            # Show AI explanation
-            st.markdown("**🤖 AI Analysis:**")
-            st.caption("AI automatically detected and mapped columns based on column names and data patterns")
+            # Show mapping in a nice format
+            mapping_df = pd.DataFrame([
+                {"Target Column": k, "Source Column": v if v else "Not found"}
+                for k, v in mapping.items()
+            ])
+            st.dataframe(mapping_df, use_container_width=True)
 
 def file_management_page(warehouse: AIWarehouse):
     """File management"""
@@ -705,13 +828,20 @@ def file_management_page(warehouse: AIWarehouse):
     with col2:
         if st.button("📥 Export All Data", type="primary", use_container_width=True):
             export_df = st.session_state.data_warehouse.copy()
+            # Remove internal columns
+            export_df = export_df[[col for col in export_df.columns if not col.startswith('_')]]
             csv = export_df.to_csv(index=False).encode()
-            st.download_button("Download CSV", csv, f"full_export_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
+            st.download_button(
+                "Download CSV",
+                csv,
+                f"full_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "text/csv"
+            )
     
     # Show file list
     if st.session_state.file_metadata:
         st.markdown("---")
-        st.subheader("Uploaded Files")
+        st.subheader("Uploaded Files History")
         files_df = pd.DataFrame(st.session_state.file_metadata)
         st.dataframe(files_df, use_container_width=True)
 
@@ -722,27 +852,32 @@ def system_info_page(warehouse: AIWarehouse):
     st.markdown("""
     ### 🤖 AI-Powered Real Estate Data Warehouse
     
+    **Version:** 2.0
+    
     **Features:**
-    - **AI Column Detection**: Uses Claude AI to automatically map columns from any file structure
-    - **Smart Error Handling**: Automatically fixes Excel format issues and missing columns
-    - **Contact Number Standardization**: Automatically standardizes contact numbers to 10 digits
-    - **Intelligent Deduplication**: Uses contact numbers as primary key
+    - **Smart Column Detection**: Automatically identifies contact numbers, names, emails, and addresses
+    - **Multi-Format Support**: Handles Excel (.xlsx, .xls) and CSV files
+    - **Deduplication**: Uses contact numbers as unique identifiers
     - **Dynamic Querying**: Search across all data with multiple filters
+    - **Analytics Dashboard**: Visual insights into your data
     
-    ### How AI Helps
+    ### How It Works
     
-    1. **Column Mapping**: AI analyzes column names and sample data to identify contact numbers, names, emails, addresses, etc.
-    2. **Format Detection**: Automatically handles different Excel formats (.xls, .xlsx)
-    3. **Data Cleaning**: Standardizes phone numbers and handles missing values
+    1. **Upload Files**: Upload Excel or CSV files with any column structure
+    2. **Auto-Detection**: System identifies contact numbers, names, emails, etc.
+    3. **Deduplication**: Records are merged using contact numbers as keys
+    4. **Query & Export**: Search, filter, and export consolidated data
     
-    ### Supported File Formats
-    - Excel (.xlsx, .xls) with automatic engine detection
-    - CSV files
+    ### File Format Support
     
-    ### Privacy Note
+    - **Excel**: .xlsx (openpyxl), .xls (xlrd)
+    - **CSV**: UTF-8, Latin-1, ISO-8859-1 encodings
+    
+    ### Data Privacy
+    
+    - All processing happens in memory
     - No data is stored permanently
-    - AI processing uses only column structures, not actual data values
-    - API keys are not stored
+    - API keys are not saved
     """)
 
 if __name__ == "__main__":
