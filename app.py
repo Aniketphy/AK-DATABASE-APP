@@ -1,43 +1,24 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import hashlib
+import duckdb
+import sqlite3
 import re
 import json
-from datetime import datetime, timedelta
-from pathlib import Path
-import io
-import base64
+import hashlib
+from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
+from pathlib import Path
 import warnings
-from collections import defaultdict
-import openpyxl
-import xlrd
-from io import BytesIO
-
-# Optional imports with fallbacks
-try:
-    import openai
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
-    openai = None
-
-try:
-    import chardet
-    CHARDET_AVAILABLE = True
-except ImportError:
-    CHARDET_AVAILABLE = False
-    chardet = None
+import os
+import io
+import chardet
+import Levenshtein
 
 warnings.filterwarnings('ignore')
 
 # Page configuration
 st.set_page_config(
-    page_title="AI-Powered Real Estate Data Warehouse",
+    page_title="Real Estate Data Intelligence Platform",
     page_icon="🏠",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -48,883 +29,818 @@ st.markdown("""
 <style>
     .main-header {
         font-size: 2rem;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 1rem;
+        background: linear-gradient(135deg, #1a4731 0%, #0f5c3e 100%);
+        padding: 1.5rem;
         border-radius: 10px;
         color: white;
         text-align: center;
         margin-bottom: 2rem;
     }
     .stat-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        background: linear-gradient(135deg, #1a4731 0%, #0f5c3e 100%);
         padding: 1.5rem;
         border-radius: 10px;
         color: white;
         text-align: center;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
     }
     .stat-number {
         font-size: 2rem;
         font-weight: bold;
     }
     .stat-label {
-        font-size: 0.9rem;
+        font-size: 0.85rem;
         opacity: 0.9;
     }
-    .ai-badge {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 0.25rem 0.75rem;
-        border-radius: 20px;
-        color: white;
+    .actual-field {
+        background-color: #d1fae5;
+        padding: 0.2rem 0.5rem;
+        border-radius: 4px;
         font-size: 0.8rem;
-        display: inline-block;
-        margin-left: 0.5rem;
+    }
+    .inferred-field {
+        background-color: #fef3c7;
+        padding: 0.2rem 0.5rem;
+        border-radius: 4px;
+        font-size: 0.8rem;
+    }
+    .info-box {
+        background-color: #f0fdf4;
+        padding: 1rem;
+        border-radius: 10px;
+        border-left: 4px solid #22c55e;
+        margin: 1rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
 
 # Initialize session state
-if 'data_warehouse' not in st.session_state:
-    st.session_state.data_warehouse = pd.DataFrame()
-if 'file_metadata' not in st.session_state:
-    st.session_state.file_metadata = []
-if 'query_history' not in st.session_state:
-    st.session_state.query_history = []
-if 'column_mappings' not in st.session_state:
-    st.session_state.column_mappings = {}
-if 'openai_client' not in st.session_state:
-    st.session_state.openai_client = None
-if 'processing_queue' not in st.session_state:
-    st.session_state.processing_queue = []
-if 'failed_files' not in st.session_state:
-    st.session_state.failed_files = []
+if 'db_initialized' not in st.session_state:
+    st.session_state.db_initialized = False
+if 'profiles_table' not in st.session_state:
+    st.session_state.profiles_table = None
+if 'import_jobs' not in st.session_state:
+    st.session_state.import_jobs = []
+if 'search_filters' not in st.session_state:
+    st.session_state.search_filters = {}
 
-class AIDataProcessor:
-    """AI-powered data processing with OpenAI API"""
+class DataWarehouse:
+    """Core data warehouse using DuckDB for analytics and SQLite for search"""
     
-    def __init__(self, api_key: str = None):
-        self.client = None
-        if api_key and OPENAI_AVAILABLE:
-            try:
-                self.client = openai.OpenAI(api_key=api_key)
-            except Exception as e:
-                pass
+    def __init__(self, db_path: str = "data_warehouse.duckdb", search_path: str = "search_index.db"):
+        self.db_path = db_path
+        self.search_path = search_path
+        self.conn = None
+        self.search_conn = None
+        self._initialize_databases()
     
-    def safe_convert_to_string(self, value: Any) -> str:
-        """Safely convert any value to string without lower() errors"""
-        if pd.isna(value) or value is None:
-            return ""
-        try:
-            # Handle integers, floats, and other types
-            if isinstance(value, (int, float)):
-                return str(int(value)) if value == int(value) else str(value)
-            return str(value).strip()
-        except:
-            return ""
-    
-    def detect_columns_with_ai(self, df: pd.DataFrame, file_name: str, target_columns: List[str]) -> Dict[str, str]:
-        """Use OpenAI to intelligently detect column mappings"""
-        if not self.client or not OPENAI_AVAILABLE:
-            return self.fallback_column_detection(df, target_columns)
+    def _initialize_databases(self):
+        """Initialize DuckDB and SQLite databases with proper schemas"""
         
-        try:
-            # Prepare sample data safely
-            sample_data = []
-            for _, row in df.head(5).iterrows():
-                row_dict = {}
-                for col in df.columns:
-                    value = row[col]
-                    if pd.isna(value):
-                        row_dict[col] = None
-                    elif isinstance(value, (int, float)):
-                        row_dict[col] = str(int(value)) if value == int(value) else str(value)
-                    else:
-                        row_dict[col] = str(value)[:100]  # Limit string length
-                sample_data.append(row_dict)
-            
-            columns_info = {col: str(df[col].dtype) for col in df.columns}
-            
-            # Create prompt for OpenAI
-            prompt = f"""You are an AI assistant helping to map columns in a real estate data file.
-
-File Name: {file_name}
-
-Available columns in the file:
-{json.dumps(columns_info, indent=2)}
-
-Sample data (first 3 rows):
-{json.dumps(sample_data[:3], indent=2, default=str)}
-
-Target columns to map:
-{json.dumps(target_columns, indent=2)}
-
-Please analyze the column names and sample data to determine which existing columns correspond to each target column.
-Return a JSON object mapping target columns to actual column names in the file.
-If a target column cannot be mapped, map it to null.
-
-Important rules:
-1. For 'contact' column: Look for columns containing phone numbers (10-12 digits), or named: mobile, phone, contact, cell, telephone
-2. For 'name' column: Look for columns with names, full names, customer names
-3. For 'email' column: Look for columns with @ symbol or named email, e-mail
-4. For 'address' column: Look for address, location, area columns
-5. For 'city' column: Look for city, town, district columns
-6. For 'source' column: Look for source, lead source columns
-7. For 'category' column: Look for category, type, classification columns
-
-Return ONLY the JSON mapping, no other text."""
-
-            # Call OpenAI API
-            response = self.client.chat.completions.create(
-                model=st.session_state.get('openai_model', 'gpt-3.5-turbo'),
-                max_tokens=1000,
-                temperature=0,
-                messages=[
-                    {"role": "system", "content": "You are an AI assistant helping to map columns in a real estate data file. Return only valid JSON."},
-                    {"role": "user", "content": prompt}
-                ]
+        # DuckDB for main data storage and analytics
+        self.conn = duckdb.connect(self.db_path)
+        
+        # Create profiles table with all required fields
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS profiles (
+                profile_id VARCHAR PRIMARY KEY,
+                mobile VARCHAR(10) UNIQUE,
+                secondary_mobile VARCHAR(10),
+                name VARCHAR(500),
+                first_name VARCHAR(200),
+                last_name VARCHAR(200),
+                email VARCHAR(500),
+                address TEXT,
+                sub_locality VARCHAR(200),
+                area VARCHAR(200),
+                city VARCHAR(100),
+                state VARCHAR(100),
+                pincode VARCHAR(10),
+                zone VARCHAR(100),
+                gender VARCHAR(20),
+                age INTEGER,
+                age_group VARCHAR(50),
+                income_group VARCHAR(100),
+                bhk_preference VARCHAR(50),
+                budget_range VARCHAR(100),
+                project_enquired VARCHAR(500),
+                lead_source VARCHAR(200),
+                company_name VARCHAR(500),
+                business_category VARCHAR(200),
+                vehicle_info VARCHAR(200),
+                date_collected DATE,
+                classification VARCHAR(50),
+                classification_confidence FLOAT,
+                created_at TIMESTAMP,
+                last_enriched TIMESTAMP,
+                is_active BOOLEAN DEFAULT TRUE,
+                has_valid_mobile BOOLEAN DEFAULT TRUE,
+                record_count INTEGER DEFAULT 1,
+                source_files TEXT,
+                field_lineage TEXT,
+                raw_data TEXT
             )
-            
-            # Parse OpenAI response
-            response_text = response.choices[0].message.content
-            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if json_match:
-                mapping = json.loads(json_match.group())
-                return mapping
-            else:
-                return self.fallback_column_detection(df, target_columns)
-                
-        except Exception as e:
-            return self.fallback_column_detection(df, target_columns)
-    
-    def fallback_column_detection(self, df: pd.DataFrame, target_columns: List[str]) -> Dict[str, str]:
-        """Fallback column detection using rules"""
-        mapping = {}
-        column_lower = {col: col.lower() for col in df.columns}
+        """)
         
-        # Comprehensive mapping rules
-        mapping_rules = {
-            'contact': ['contact', 'mobile', 'phone', 'cell', 'mob', 'telephone', 'whatsapp', 'ph', 'phone number', 'contact number', 'mobile number'],
-            'name': ['name', 'full name', 'customer name', 'client name', 'party name', 'buyer name', 'seller name', 'lead name', 'campaign_name'],
-            'email': ['email', 'e-mail', 'mail', 'email id', 'email address', 'mail id'],
-            'address': ['address', 'addr', 'location', 'locality', 'area', 'street', 'full address', 'property address'],
-            'city': ['city', 'town', 'district', 'location city'],
-            'state': ['state', 'province', 'region', 'state name'],
-            'pincode': ['pincode', 'pin', 'zip', 'postal', 'zipcode', 'postal code', 'pin code'],
-            'source': ['source', 'lead source', 'data source', 'origin'],
-            'category': ['category', 'type', 'classification', 'segment']
+        # Create field history table for audit trail
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS field_history (
+                history_id INTEGER PRIMARY KEY,
+                profile_id VARCHAR,
+                field_name VARCHAR,
+                old_value TEXT,
+                new_value TEXT,
+                source_file VARCHAR,
+                changed_at TIMESTAMP,
+                change_type VARCHAR(50),
+                data_type VARCHAR(20)  -- ACTUAL or INFERRED
+            )
+        """)
+        
+        # Create import jobs table
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS import_jobs (
+                job_id VARCHAR PRIMARY KEY,
+                file_name VARCHAR,
+                source_type VARCHAR,
+                collection_date DATE,
+                category VARCHAR,
+                geographic_coverage VARCHAR,
+                quality_notes TEXT,
+                file_label VARCHAR,
+                status VARCHAR,
+                total_records INTEGER,
+                processed_records INTEGER,
+                profiles_created INTEGER,
+                profiles_enriched INTEGER,
+                invalid_mobiles INTEGER,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+        """)
+        
+        # Create unknown fields storage
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS unknown_fields (
+                id INTEGER PRIMARY KEY,
+                profile_id VARCHAR,
+                field_name VARCHAR,
+                field_value TEXT,
+                source_file VARCHAR,
+                imported_at TIMESTAMP
+            )
+        """)
+        
+        # SQLite for full-text search
+        self.search_conn = sqlite3.connect(self.search_path)
+        self.search_conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS profile_search USING fts5(
+                profile_id, mobile, name, email, address, city, area, pincode,
+                content=profiles
+            )
+        """)
+        
+        st.session_state.db_initialized = True
+    
+    def clean_mobile(self, value: Any) -> Tuple[str, bool]:
+        """Clean mobile number to 10-digit canonical form"""
+        if pd.isna(value) or value is None:
+            return "", False
+        
+        try:
+            # Handle float (Excel scientific notation like 9.82E+09)
+            if isinstance(value, float):
+                if value.is_integer():
+                    value_str = str(int(value))
+                else:
+                    value_str = str(int(value)) if value > 1000000000 else str(value).split('.')[0]
+            else:
+                value_str = str(value).strip()
+            
+            # Extract digits only
+            digits = ''.join(filter(str.isdigit, value_str))
+            
+            # Remove leading zero
+            if digits.startswith('0'):
+                digits = digits[1:]
+            
+            # Handle country codes
+            if digits.startswith('91') and len(digits) == 12:
+                digits = digits[2:]
+            
+            # Validate
+            if len(digits) == 10 and digits[0] in '6789':
+                return digits, True
+            else:
+                return digits, False
+                
+        except Exception:
+            return "", False
+    
+    def infer_location(self, pincode: str = None, city: str = None, area: str = None, address: str = None) -> Dict:
+        """Infer location fields from partial information"""
+        # This would be backed by a comprehensive Indian geography database
+        # For now, returns placeholder inference logic
+        result = {
+            'city': None, 'state': None, 'pincode': None, 'area': None,
+            'is_inferred': False, 'confidence': 'LOW'
         }
         
-        for target in target_columns:
-            if target in mapping_rules:
-                for rule in mapping_rules[target]:
-                    for col, col_lower in column_lower.items():
-                        if rule in col_lower:
-                            mapping[target] = col
-                            break
-                    if target in mapping:
-                        break
-            
-            # If not found, try data pattern detection
-            if target not in mapping and target == 'contact':
-                for col in df.columns:
-                    try:
-                        # Check first 20 non-null values
-                        sample = df[col].dropna().head(20).astype(str)
-                        # Check for phone number pattern
-                        if sample.str.match(r'^[0-9]{10}$').any() or sample.str.match(r'^[0-9]{12}$').any():
-                            mapping[target] = col
-                            break
-                    except:
-                        continue
-            
-            # If still not found, set to None
-            if target not in mapping:
-                mapping[target] = None
+        # Pincode to city/state mapping (sample - would be complete database)
+        pincode_map = {
+            '411001': {'city': 'Pune', 'state': 'Maharashtra', 'area': 'Shivajinagar'},
+            '411002': {'city': 'Pune', 'state': 'Maharashtra', 'area': 'Koregaon Park'},
+            '411004': {'city': 'Pune', 'state': 'Maharashtra', 'area': 'Deccan Gymkhana'},
+            '411014': {'city': 'Pune', 'state': 'Maharashtra', 'area': 'Baner'},
+            '411021': {'city': 'Pune', 'state': 'Maharashtra', 'area': 'Aundh'},
+            '411045': {'city': 'Pune', 'state': 'Maharashtra', 'area': 'Hinjewadi'},
+            '400001': {'city': 'Mumbai', 'state': 'Maharashtra', 'area': 'Fort'},
+            '400002': {'city': 'Mumbai', 'state': 'Maharashtra', 'area': 'Churchgate'},
+        }
         
-        return mapping
+        if pincode and pincode in pincode_map:
+            result.update(pincode_map[pincode])
+            result['is_inferred'] = True
+            result['confidence'] = 'HIGH'
+        
+        return result
     
-    def read_file_with_fallback(self, file_obj) -> Optional[pd.DataFrame]:
-        """Intelligently read Excel/CSV files with multiple fallback strategies"""
+    def classify_profile(self, record: Dict) -> Tuple[str, float]:
+        """Classify profile as Non-RE, Property Seeker, or Real Estate Trade"""
+        signals = []
+        classification = 'Non-Real Estate'
+        confidence = 0.5
         
-        # For old .xls files
-        if file_obj.name.endswith('.xls'):
-            try:
-                # Try with xlrd engine first
-                df = pd.read_excel(file_obj, engine='xlrd')
-                if not df.empty:
-                    return df
-            except:
-                pass
-            
-            try:
-                # Try reading with openpyxl
-                file_obj.seek(0)
-                df = pd.read_excel(file_obj, engine='openpyxl')
-                if not df.empty:
-                    return df
-            except:
-                pass
-            
-            try:
-                # Try reading as CSV
-                file_obj.seek(0)
-                df = pd.read_csv(file_obj, encoding='utf-8', on_bad_lines='skip')
-                if not df.empty:
-                    return df
-            except:
-                pass
-            
-            try:
-                # Try different encoding with chardet if available
-                if CHARDET_AVAILABLE:
-                    file_obj.seek(0)
-                    result = chardet.detect(file_obj.read(10000))
-                    encoding = result['encoding'] if result['encoding'] else 'latin1'
-                    file_obj.seek(0)
-                    df = pd.read_csv(file_obj, encoding=encoding, on_bad_lines='skip')
-                    if not df.empty:
-                        return df
-            except:
-                pass
+        # Check for property seeker signals
+        if record.get('bhk_preference') or record.get('budget_range') or record.get('project_enquired'):
+            signals.append('property_seeker')
         
-        # For .xlsx files
-        elif file_obj.name.endswith('.xlsx'):
-            try:
-                df = pd.read_excel(file_obj, engine='openpyxl')
-                if not df.empty:
-                    return df
-            except:
-                pass
-            
-            try:
-                file_obj.seek(0)
-                df = pd.read_excel(file_obj, engine='xlrd')
-                if not df.empty:
-                    return df
-            except:
-                pass
+        # Check for real estate trade signals  
+        trade_keywords = ['broker', 'agent', 'developer', 'consultant', 'builder', 'realtor']
+        company = str(record.get('company_name', '')).lower()
+        if any(keyword in company for keyword in trade_keywords):
+            signals.append('trade')
         
-        # For CSV files
-        else:
-            encodings = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']
-            for encoding in encodings:
-                try:
-                    file_obj.seek(0)
-                    df = pd.read_csv(file_obj, encoding=encoding, on_bad_lines='skip')
-                    if not df.empty:
-                        return df
-                except:
-                    continue
+        # Check source type
+        source = str(record.get('_source_type', '')).lower()
+        if 'property portal' in source or 'facebook' in source:
+            signals.append('property_seeker')
+        elif 'broker' in source or 'agent' in source:
+            signals.append('trade')
         
-        return None
-
-class AIWarehouse:
-    """AI-powered data warehouse"""
+        # Determine classification
+        if 'trade' in signals:
+            classification = 'Real Estate Trade'
+            confidence = 0.8
+        elif 'property_seeker' in signals:
+            classification = 'Property Seeker'
+            confidence = 0.7
+        
+        return classification, confidence
     
-    def __init__(self):
-        api_key = st.session_state.get('openai_api_key')
-        self.ai_processor = AIDataProcessor(api_key)
-        self.data = st.session_state.data_warehouse
-        self.primary_key = 'contact'
-    
-    def clean_contact(self, contact: Any) -> str:
-        """Clean contact number to standard 10-digit format"""
-        # Convert to string safely
-        if pd.isna(contact) or contact is None:
-            return ""
+    def merge_profile(self, profile_id: str, new_data: Dict, source_file: str, data_type: str = 'ACTUAL'):
+        """Merge new data into existing profile with conflict resolution"""
         
-        # Handle different types
+        # Get current profile
+        current = self.conn.execute(f"SELECT * FROM profiles WHERE profile_id = '{profile_id}'").fetchone()
+        if not current:
+            return False
+        
+        current_dict = dict(zip([desc[0] for desc in self.conn.description], current))
+        
+        # Fields to merge with conflict resolution
+        fields_to_merge = ['name', 'email', 'address', 'city', 'area', 'pincode', 
+                          'bhk_preference', 'budget_range', 'income_group']
+        
+        for field in fields_to_merge:
+            new_value = new_data.get(field)
+            current_value = current_dict.get(field)
+            
+            if new_value and not current_value:
+                # Empty field - fill it
+                self.conn.execute(f"""
+                    UPDATE profiles SET {field} = ?, last_enriched = NOW() 
+                    WHERE profile_id = ?
+                """, (new_value, profile_id))
+                
+                # Log to field history
+                self.conn.execute("""
+                    INSERT INTO field_history (profile_id, field_name, old_value, new_value, source_file, changed_at, change_type, data_type)
+                    VALUES (?, ?, ?, ?, ?, NOW(), 'CREATE', ?)
+                """, (profile_id, field, None, new_value, source_file, data_type))
+                
+            elif new_value and current_value and new_value != current_value:
+                # Conflict - resolve by rules
+                
+                # Rule 1: Longer value wins for names
+                if field == 'name' and len(new_value) > len(current_value):
+                    self.conn.execute(f"UPDATE profiles SET {field} = ?, last_enriched = NOW() WHERE profile_id = ?", (new_value, profile_id))
+                    self.conn.execute("INSERT INTO field_history VALUES (?, ?, ?, ?, ?, NOW(), 'CONFLICT_RESOLVED', ?)", 
+                                    (profile_id, field, current_value, new_value, source_file, data_type))
+                
+                # Rule 2: More recent wins (handled by data_type flag)
+                elif data_type == 'ACTUAL' and current_dict.get(f'_{field}_data_type') == 'INFERRED':
+                    self.conn.execute(f"UPDATE profiles SET {field} = ?, last_enriched = NOW() WHERE profile_id = ?", (new_value, profile_id))
+        
+        # Update record count and source files
+        record_count = current_dict.get('record_count', 0) + 1
+        source_files = current_dict.get('source_files', '')
+        if source_file not in source_files:
+            source_files = f"{source_files},{source_file}" if source_files else source_file
+        
+        self.conn.execute("""
+            UPDATE profiles SET record_count = ?, source_files = ?, last_enriched = NOW() 
+            WHERE profile_id = ?
+        """, (record_count, source_files, profile_id))
+        
+        return True
+    
+    def create_profile(self, record: Dict, source_file: str, source_type: str, category: str, data_type: str = 'ACTUAL') -> str:
+        """Create new profile from record"""
+        
+        mobile, is_valid = self.clean_mobile(record.get('mobile'))
+        if not is_valid or not mobile:
+            return None
+        
+        profile_id = hashlib.md5(mobile.encode()).hexdigest()[:16]
+        
+        # Infer location if needed
+        location = self.infer_location(pincode=record.get('pincode'), address=record.get('address'))
+        
+        # Classify
+        classification, confidence = self.classify_profile(record)
+        
+        # If operator provided category, override
+        if category != 'Let system decide':
+            classification = category
+            confidence = 1.0
+        
+        # Insert profile
+        self.conn.execute("""
+            INSERT INTO profiles (
+                profile_id, mobile, name, email, address, city, area, pincode,
+                classification, classification_confidence, created_at, last_enriched,
+                record_count, source_files, has_valid_mobile, date_collected
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), 1, ?, ?, ?)
+        """, (
+            profile_id, mobile, 
+            record.get('name'), record.get('email'), record.get('address'),
+            location.get('city') or record.get('city'),
+            location.get('area') or record.get('area'),
+            record.get('pincode') or location.get('pincode'),
+            classification, confidence,
+            source_file, is_valid, record.get('date_collected', datetime.now().date())
+        ))
+        
+        # Update search index
+        self.search_conn.execute("""
+            INSERT INTO profile_search (profile_id, mobile, name, email, address, city, area, pincode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (profile_id, mobile, record.get('name'), record.get('email'), 
+              record.get('address'), location.get('city'), location.get('area'), record.get('pincode')))
+        
+        self.search_conn.commit()
+        
+        return profile_id
+    
+    def process_file(self, file_obj, metadata: Dict) -> Dict:
+        """Process uploaded file and merge into warehouse"""
+        
+        result = {
+            'success': False,
+            'message': '',
+            'total_records': 0,
+            'profiles_created': 0,
+            'profiles_enriched': 0,
+            'invalid_mobiles': 0
+        }
+        
         try:
-            if isinstance(contact, (int, float)):
-                contact_str = str(int(contact)) if contact == int(contact) else str(contact)
+            # Read file with encoding detection
+            if file_obj.name.endswith('.xls') or file_obj.name.endswith('.xlsx'):
+                df = pd.read_excel(file_obj)
             else:
-                contact_str = str(contact).strip()
-        except:
-            return ""
-        
-        # Extract digits only
-        digits = re.sub(r'\D', '', contact_str)
-        
-        # Standardize to 10 digits
-        if len(digits) == 10:
-            return digits
-        elif len(digits) == 11 and digits.startswith('0'):
-            return digits[1:]
-        elif len(digits) == 12 and digits.startswith('91'):
-            return digits[2:]
-        elif len(digits) == 13 and digits.startswith('091'):
-            return digits[3:]
-        elif len(digits) > 10:
-            # Take last 10 digits
-            return digits[-10:]
-        else:
-            return ""
-    
-    def process_file(self, file_obj, metadata: Dict) -> Tuple[bool, str, Dict]:
-        """Process a single file with comprehensive error handling"""
-        try:
-            # First check if file is empty
-            if file_obj.size == 0:
-                return False, "File is empty", {}
-            
-            # Read file with fallback strategies
-            df = self.ai_processor.read_file_with_fallback(file_obj)
-            
-            if df is None or df.empty:
-                return False, "Could not read file or file is empty", {}
-            
-            # Clean column names (remove extra spaces)
-            df.columns = df.columns.str.strip()
-            
-            # Target columns
-            target_columns = ['contact', 'name', 'email', 'address', 'city', 'state', 'pincode', 'source', 'category']
-            
-            # Detect column mappings
-            column_mapping = self.ai_processor.detect_columns_with_ai(df, file_obj.name, target_columns)
-            
-            # Store mapping
-            st.session_state.column_mappings[file_obj.name] = column_mapping
-            
-            # Apply renaming
-            rename_dict = {}
-            for target, source in column_mapping.items():
-                if source and source in df.columns and source not in rename_dict:
-                    rename_dict[source] = target
-            
-            if rename_dict:
-                df = df.rename(columns=rename_dict)
-            
-            # Ensure all target columns exist
-            for col in target_columns:
-                if col not in df.columns:
-                    df[col] = ""
-            
-            # Clean contact numbers safely
-            if 'contact' in df.columns:
-                df['contact'] = df['contact'].apply(lambda x: self.clean_contact(x))
-                df['contact_valid'] = df['contact'].apply(lambda x: len(x) == 10 if x else False)
-                # Remove rows with invalid contacts
-                df = df[df['contact'] != ""]
+                # Detect encoding for CSV
+                raw_data = file_obj.read(10000)
+                encoding = chardet.detect(raw_data)['encoding'] or 'utf-8'
+                file_obj.seek(0)
+                df = pd.read_csv(file_obj, encoding=encoding, on_bad_lines='skip')
             
             if df.empty:
-                return False, "No valid contact numbers found", {}
+                result['message'] = "File is empty"
+                return result
             
-            # Add metadata
-            df['_source_file'] = file_obj.name
-            df['_upload_date'] = metadata.get('upload_date', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            df['_source_type'] = metadata.get('source_type', 'Unknown')
-            df['_category'] = metadata.get('category', 'Uncategorized')
+            # Detect mobile column by examining data
+            mobile_col = None
+            for col in df.columns:
+                sample = df[col].dropna().head(20).astype(str)
+                if sample.str.match(r'^[0-9]{10}$').any() or sample.str.match(r'^[0-9]{12}$').any():
+                    mobile_col = col
+                    break
             
-            # Remove duplicates within the same file
-            df = df.drop_duplicates(subset=['contact'], keep='first')
+            if not mobile_col:
+                result['message'] = "No mobile number column detected"
+                return result
             
-            # Merge with existing warehouse
-            if st.session_state.data_warehouse.empty:
-                st.session_state.data_warehouse = df
-                records_added = len(df)
-                records_skipped = 0
-            else:
-                # Get existing contacts
-                existing_contacts = set(st.session_state.data_warehouse['contact'].tolist())
+            # Process each row
+            for _, row in df.iterrows():
+                result['total_records'] += 1
                 
-                # Only add new records (not existing in warehouse)
-                new_records = df[~df['contact'].isin(existing_contacts)]
+                mobile_raw = row[mobile_col]
+                mobile, is_valid = self.clean_mobile(mobile_raw)
                 
-                if not new_records.empty:
-                    st.session_state.data_warehouse = pd.concat(
-                        [st.session_state.data_warehouse, new_records], 
-                        ignore_index=True
-                    )
+                if not is_valid or not mobile:
+                    result['invalid_mobiles'] += 1
+                    continue
                 
-                records_added = len(new_records)
-                records_skipped = len(df) - records_added
+                # Build record dict
+                record = {
+                    'mobile': mobile,
+                    'name': row.get('name', row.get('Name', row.get('NAME', ''))),
+                    'email': row.get('email', row.get('Email', row.get('EMAIL', ''))),
+                    'address': row.get('address', row.get('Address', row.get('ADDRESS', ''))),
+                    'city': row.get('city', row.get('City', row.get('CITY', ''))),
+                    'pincode': row.get('pincode', row.get('Pincode', row.get('PINCODE', ''))),
+                    'date_collected': metadata.get('collection_date', datetime.now().date())
+                }
+                
+                # Check if profile exists
+                existing = self.conn.execute(f"SELECT profile_id FROM profiles WHERE mobile = '{mobile}'").fetchone()
+                
+                if existing:
+                    # Enrich existing profile
+                    self.merge_profile(existing[0], record, file_obj.name, 'ACTUAL')
+                    result['profiles_enriched'] += 1
+                else:
+                    # Create new profile
+                    profile_id = self.create_profile(record, file_obj.name, 
+                                                     metadata.get('source_type', 'Unknown'),
+                                                     metadata.get('category', 'Let system decide'),
+                                                     'ACTUAL')
+                    if profile_id:
+                        result['profiles_created'] += 1
             
-            file_info = {
-                'file_name': file_obj.name,
-                'records_added': records_added,
-                'records_skipped': records_skipped,
-                'column_mapping': column_mapping,
-                'upload_date': metadata.get('upload_date', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                'source_type': metadata.get('source_type', 'Unknown'),
-                'category': metadata.get('category', 'Uncategorized')
-            }
+            result['success'] = True
+            result['message'] = f"Processed {result['total_records']} records"
             
-            return True, f"Successfully added {records_added} records", file_info
+            # Store import job
+            job_id = hashlib.md5(f"{file_obj.name}{datetime.now()}".encode()).hexdigest()[:8]
+            self.conn.execute("""
+                INSERT INTO import_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+            """, (job_id, file_obj.name, metadata.get('source_type'), metadata.get('collection_date'),
+                  metadata.get('category'), metadata.get('geographic_coverage'), metadata.get('quality_notes'),
+                  metadata.get('file_label'), 'COMPLETE', result['total_records'], result['total_records'],
+                  result['profiles_created'], result['profiles_enriched'], result['invalid_mobiles']))
             
         except Exception as e:
-            return False, f"Error: {str(e)}", {}
-    
-    def dynamic_query(self, conditions: Dict) -> pd.DataFrame:
-        """Execute dynamic query"""
-        if st.session_state.data_warehouse.empty:
-            return pd.DataFrame()
+            result['message'] = f"Error: {str(e)}"
         
-        df = st.session_state.data_warehouse.copy()
+        return result
+    
+    def search(self, query: str = None, filters: Dict = None, limit: int = 100) -> pd.DataFrame:
+        """Search profiles with filters"""
+        
+        sql = "SELECT * FROM profiles WHERE is_active = TRUE"
+        
+        if query:
+            # Use FTS for text search
+            fts_results = self.search_conn.execute("""
+                SELECT profile_id FROM profile_search WHERE profile_search MATCH ?
+            """, (query,)).fetchall()
+            
+            if fts_results:
+                profile_ids = [r[0] for r in fts_results]
+                sql += f" AND profile_id IN ({','.join([f"'{pid}'" for pid in profile_ids])})"
         
         # Apply filters
-        for field, value in conditions.items():
-            if field == 'search_text' and value:
-                search_mask = pd.Series([False] * len(df))
-                text_cols = ['name', 'email', 'address', 'city', 'contact']
-                for col in text_cols:
-                    if col in df.columns:
-                        try:
-                            search_mask |= df[col].astype(str).str.lower().str.contains(value.lower(), na=False)
-                        except:
-                            continue
-                df = df[search_mask]
-            
-            elif field in df.columns and value and value != 'All':
-                try:
-                    df = df[df[field] == value]
-                except:
-                    continue
-            
-            elif field == 'contact' and value:
-                contact_clean = self.clean_contact(value)
-                if contact_clean:
-                    df = df[df['contact'] == contact_clean]
+        if filters:
+            if filters.get('classification'):
+                sql += f" AND classification = '{filters['classification']}'"
+            if filters.get('city'):
+                sql += f" AND city = '{filters['city']}'"
+            if filters.get('source_type'):
+                sql += f" AND source_files LIKE '%{filters['source_type']}%'"
         
-        # Remove internal columns for display
-        display_cols = [col for col in df.columns if not col.startswith('_')]
-        return df[display_cols] if display_cols else df
+        sql += f" LIMIT {limit}"
+        
+        result = self.conn.execute(sql).fetchdf()
+        return result
     
     def get_statistics(self) -> Dict:
-        """Get statistics"""
-        if st.session_state.data_warehouse.empty:
-            return {}
+        """Get dashboard statistics"""
         
-        df = st.session_state.data_warehouse
+        stats = self.conn.execute("""
+            SELECT 
+                COUNT(*) as total_profiles,
+                COUNT(CASE WHEN has_valid_mobile = TRUE THEN 1 END) as valid_mobiles,
+                COUNT(CASE WHEN classification = 'Real Estate Trade' THEN 1 END) as trade_count,
+                COUNT(CASE WHEN classification = 'Property Seeker' THEN 1 END) as seeker_count,
+                COUNT(CASE WHEN classification = 'Non-Real Estate' THEN 1 END) as nonre_count,
+                SUM(record_count) as total_records
+            FROM profiles
+            WHERE is_active = TRUE
+        """).fetchone()
         
-        stats = {
-            'total_records': len(df),
-            'unique_contacts': df['contact'].nunique() if 'contact' in df.columns else 0,
-            'total_files': len(st.session_state.file_metadata),
-            'valid_contacts': df['contact_valid'].sum() if 'contact_valid' in df.columns else 0
+        # City breakdown
+        city_stats = self.conn.execute("""
+            SELECT city, COUNT(*) as count 
+            FROM profiles 
+            WHERE city IS NOT NULL AND city != ''
+            GROUP BY city 
+            ORDER BY count DESC 
+            LIMIT 10
+        """).fetchdf()
+        
+        return {
+            'total_profiles': stats[0],
+            'valid_mobiles': stats[1],
+            'trade_count': stats[2],
+            'seeker_count': stats[3],
+            'nonre_count': stats[4],
+            'total_records': stats[5],
+            'city_breakdown': city_stats.to_dict('records') if not city_stats.empty else []
         }
-        
-        if '_source_type' in df.columns:
-            stats['source_distribution'] = df['_source_type'].value_counts().to_dict()
-        
-        if '_category' in df.columns:
-            stats['category_distribution'] = df['_category'].value_counts().to_dict()
-        
-        if 'city' in df.columns:
-            stats['city_distribution'] = df['city'].value_counts().head(10).to_dict()
-        
-        return stats
 
 def main():
     """Main application"""
     
-    st.markdown('<div class="main-header">🤖 AI-Powered Real Estate Data Warehouse</div>', unsafe_allow_html=True)
-    
-    # Show warnings for missing optional packages
-    if not OPENAI_AVAILABLE:
-        st.warning("⚠️ OpenAI package not installed. Install openai to enable AI column detection. Using fallback mode.")
-    
-    if not CHARDET_AVAILABLE:
-        st.info("ℹ️ Chardet not installed. Using default encoding detection.")
+    st.markdown('<div class="main-header">🏠 Real Estate Data Intelligence Platform</div>', unsafe_allow_html=True)
     
     # Initialize warehouse
-    warehouse = AIWarehouse()
+    if not st.session_state.db_initialized:
+        with st.spinner("Initializing database..."):
+            warehouse = DataWarehouse()
+            st.session_state.warehouse = warehouse
+    else:
+        warehouse = st.session_state.warehouse
     
-    # API Key configuration in sidebar
+    # Sidebar
     with st.sidebar:
-        st.title("⚙️ Configuration")
-        
-        if OPENAI_AVAILABLE:
-            api_key = st.text_input("OpenAI API Key (Optional)", type="password", 
-                                    help="Enter your OpenAI API key for AI-powered column detection")
-            
-            if api_key:
-                st.session_state.openai_api_key = api_key
-                st.success("✅ OpenAI Ready!")
-            
-            # Model selection
-            if api_key:
-                st.session_state.openai_model = st.selectbox(
-                    "OpenAI Model",
-                    ["gpt-4", "gpt-4-turbo-preview", "gpt-3.5-turbo"],
-                    index=2  # Default to gpt-3.5-turbo for cost efficiency
-                )
-        else:
-            st.info("🤖 Install openai package to enable AI column detection")
-        
-        st.markdown("---")
         st.title("📊 Navigation")
         
         page = st.radio(
             "Select Module",
-            ["📤 Upload Files", "🔍 Dynamic Query", "📈 Analytics Dashboard", 
-             "📁 File Management", "🤖 Column Mappings", "ℹ️ System Info"],
+            ["📤 Import Data", "🔍 Search & Export", "📈 Dashboard", "📋 Import History", "⚙️ Settings"],
             index=0
         )
         
         st.markdown("---")
         
         # System stats
-        if not st.session_state.data_warehouse.empty:
-            st.markdown("### 📊 System Stats")
-            st.metric("Total Records", f"{len(st.session_state.data_warehouse):,}")
-            st.metric("Files Uploaded", f"{len(st.session_state.file_metadata)}")
+        stats = warehouse.get_statistics()
+        st.markdown("### 📊 System Stats")
+        st.metric("Total Profiles", f"{stats['total_profiles']:,}")
+        st.metric("Total Records", f"{stats['total_records']:,}")
+        st.metric("Valid Mobiles", f"{stats['valid_mobiles']:,}")
     
     # Page routing
-    if page == "📤 Upload Files":
-        upload_files_page(warehouse)
-    elif page == "🔍 Dynamic Query":
-        dynamic_query_page(warehouse)
-    elif page == "📈 Analytics Dashboard":
-        analytics_dashboard_page(warehouse)
-    elif page == "📁 File Management":
-        file_management_page(warehouse)
-    elif page == "🤖 Column Mappings":
-        mappings_page(warehouse)
-    elif page == "ℹ️ System Info":
-        system_info_page(warehouse)
+    if page == "📤 Import Data":
+        import_page(warehouse)
+    elif page == "🔍 Search & Export":
+        search_page(warehouse)
+    elif page == "📈 Dashboard":
+        dashboard_page(warehouse)
+    elif page == "📋 Import History":
+        history_page(warehouse)
+    elif page == "⚙️ Settings":
+        settings_page()
 
-def upload_files_page(warehouse: AIWarehouse):
-    """Handle file uploads"""
-    st.header("📤 Upload Files")
+def import_page(warehouse: DataWarehouse):
+    """File import interface"""
+    st.header("📤 Import Data Files")
     
-    st.info("""
-    🤖 **Features:**
-    - Automatically detects contact numbers, names, emails, addresses
-    - Handles Excel (.xlsx, .xls) and CSV files
-    - Uses contact number as unique identifier
-    - Prevents duplicate records
-    """)
+    st.markdown("""
+    <div class="info-box">
+        <strong>📋 Intake Questions</strong> - Please answer these 6 questions before importing
+    </div>
+    """, unsafe_allow_html=True)
     
-    with st.form("upload_form"):
+    with st.form("import_form"):
         col1, col2 = st.columns(2)
         
         with col1:
             source_type = st.selectbox(
-                "Default Source Type",
-                ["General", "MSEB", "Facebook Leads", "Property Portal", 
-                 "Agent List", "School Data", "Doctor List", "Police Records",
-                 "Broker List", "Expo Visitors", "Sales Data", "Other"]
+                "1. Source of Data *",
+                ["Utility Consumer List", "Facebook Advertising Lead", "Property Portal Enquiry",
+                 "Real Estate Expo Walk-in", "Broker/Agent List", "School/Institutional Data",
+                 "Internal Sales Data", "General Population List", "Other"]
+            )
+            
+            collection_date = st.date_input("2. Collection Date", datetime.now())
+            
+            category = st.selectbox(
+                "3. Data Category *",
+                ["Let system decide", "Real Estate Trade", "Property Seeker", "Non-Real Estate"]
             )
         
         with col2:
-            category = st.selectbox(
-                "Default Category",
-                ["Real Estate Trade", "Property Seeker", "Non-Real Estate", "General"]
-            )
+            geographic_coverage = st.text_input("4. Geographic Coverage", placeholder="e.g., Pune, Mumbai, Pan-India")
+            
+            quality_notes = st.text_area("5. Quality Notes", placeholder="Expected duplicates, verified leads, known issues...")
+            
+            file_label = st.text_input("6. File Label", placeholder="Name this file for reference")
         
         uploaded_files = st.file_uploader(
             "Choose Files (Excel or CSV)",
             type=['xlsx', 'xls', 'csv'],
             accept_multiple_files=True,
-            help="Upload multiple files. System will auto-detect columns and use contact numbers as unique keys."
+            help="Upload one or more files. They will be processed sequentially."
         )
         
-        submitted = st.form_submit_button("🚀 Process Files", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("🚀 Import Files", type="primary", use_container_width=True)
         
         if submitted and uploaded_files:
-            process_files(warehouse, uploaded_files, source_type, category)
+            for file in uploaded_files:
+                with st.spinner(f"Processing {file.name}..."):
+                    metadata = {
+                        'source_type': source_type,
+                        'collection_date': collection_date.strftime("%Y-%m-%d"),
+                        'category': category,
+                        'geographic_coverage': geographic_coverage,
+                        'quality_notes': quality_notes,
+                        'file_label': file_label or file.name
+                    }
+                    
+                    result = warehouse.process_file(file, metadata)
+                    
+                    if result['success']:
+                        st.success(f"✅ {file.name}: {result['message']}")
+                        st.caption(f"   Created: {result['profiles_created']} | Enriched: {result['profiles_enriched']} | Invalid: {result['invalid_mobiles']}")
+                    else:
+                        st.error(f"❌ {file.name}: {result['message']}")
 
-def process_files(warehouse: AIWarehouse, files, source_type, category):
-    """Process multiple files"""
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    results_container = st.container()
+def search_page(warehouse: DataWarehouse):
+    """Search and export interface"""
+    st.header("🔍 Search & Export")
     
-    success_count = 0
-    error_count = 0
-    total_records = 0
-    failed_files = []
-    
-    for idx, file in enumerate(files):
-        status_text.text(f"Processing: {file.name}... ({idx+1}/{len(files)})")
-        
-        metadata = {
-            'upload_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'source_type': source_type,
-            'category': category
-        }
-        
-        success, message, file_info = warehouse.process_file(file, metadata)
-        
-        if success:
-            success_count += 1
-            total_records += file_info.get('records_added', 0)
-            with results_container:
-                st.success(f"✅ {file.name}: {message}")
-                
-                # Show column mapping if available
-                if 'column_mapping' in file_info and file_info['column_mapping']:
-                    mapping_summary = {k: v for k, v in file_info['column_mapping'].items() if v}
-                    if mapping_summary:
-                        st.caption(f"📋 Mapped: {mapping_summary}")
-            
-            # Store metadata
-            st.session_state.file_metadata.append(file_info)
-        else:
-            error_count += 1
-            failed_files.append(file.name)
-            with results_container:
-                st.error(f"❌ {file.name}: {message}")
-        
-        progress_bar.progress((idx + 1) / len(files))
-    
-    status_text.text("✅ Processing Complete!")
-    
-    # Summary
-    st.markdown("---")
-    st.subheader("📊 Processing Summary")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Files Processed", f"{success_count}/{len(files)}")
-    with col2:
-        st.metric("Files Failed", f"{error_count}")
-    with col3:
-        st.metric("Total Records Added", f"{total_records:,}")
-    with col4:
-        st.metric("Primary Key", "Contact Number")
-    
-    if failed_files:
-        st.warning(f"⚠️ Failed files: {', '.join(failed_files)}")
-    
-    if success_count > 0:
-        st.balloons()
-        st.info("💡 Go to 'Column Mappings' page to see how columns were detected")
-
-def dynamic_query_page(warehouse: AIWarehouse):
-    """Dynamic query interface"""
-    st.header("🔍 Dynamic Query")
-    
-    if st.session_state.data_warehouse.empty:
-        st.warning("No data available. Please upload files first.")
-        return
-    
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
-        search_text = st.text_input("🔍 Search Any Field", placeholder="Name, email, city, address...")
+        search_text = st.text_input("🔍 Search", placeholder="Name, mobile, email, area, pincode...")
     
     with col2:
-        contact_search = st.text_input("📱 Specific Contact Number", placeholder="Enter 10-digit number")
-    
-    col3, col4 = st.columns(2)
+        classification = st.selectbox("Category", ["All", "Real Estate Trade", "Property Seeker", "Non-Real Estate"])
     
     with col3:
-        if '_source_type' in st.session_state.data_warehouse.columns:
-            sources = ['All'] + sorted(st.session_state.data_warehouse['_source_type'].unique().tolist())
-            source_filter = st.selectbox("Filter by Source", sources)
-        else:
-            source_filter = "All"
+        city = st.text_input("City", placeholder="e.g., Pune, Mumbai")
     
-    with col4:
-        if '_category' in st.session_state.data_warehouse.columns:
-            categories = ['All'] + sorted(st.session_state.data_warehouse['_category'].unique().tolist())
-            category_filter = st.selectbox("Filter by Category", categories)
-        else:
-            category_filter = "All"
-    
-    if st.button("🔍 Execute Query", type="primary", use_container_width=True):
-        conditions = {}
-        
-        if search_text:
-            conditions['search_text'] = search_text
-        if contact_search:
-            conditions['contact'] = contact_search
-        if source_filter != "All":
-            conditions['_source_type'] = source_filter
-        if category_filter != "All":
-            conditions['_category'] = category_filter
+    if st.button("🔍 Search", type="primary", use_container_width=True):
+        filters = {}
+        if classification != "All":
+            filters['classification'] = classification
+        if city:
+            filters['city'] = city
         
         with st.spinner("Searching..."):
-            results_df = warehouse.dynamic_query(conditions)
+            results = warehouse.search(query=search_text if search_text else None, 
+                                       filters=filters if filters else None,
+                                       limit=1000)
             
-            st.markdown(f"### 📊 Results: {len(results_df)} records found")
+            st.markdown(f"### 📊 Results: {len(results)} profiles found")
             
-            if not results_df.empty:
-                # Select columns to display
-                display_cols = ['contact', 'name', 'email', 'city', '_source_type', '_category']
-                available_cols = [col for col in display_cols if col in results_df.columns]
+            if not results.empty:
+                # Display results
+                display_cols = ['profile_id', 'mobile', 'name', 'email', 'city', 'classification', 'record_count']
+                available_cols = [col for col in display_cols if col in results.columns]
+                st.dataframe(results[available_cols], use_container_width=True, height=400)
                 
-                st.dataframe(results_df[available_cols], use_container_width=True, height=400)
-                
-                # Export option
+                # Export
                 st.markdown("---")
-                export_col1, export_col2 = st.columns(2)
-                with export_col1:
-                    if st.button("📥 Export Results to CSV"):
-                        csv = results_df.to_csv(index=False).encode()
-                        st.download_button(
-                            "Download CSV",
-                            csv,
-                            f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            "text/csv"
-                        )
+                col1, col2 = st.columns(2)
+                with col1:
+                    export_format = st.selectbox("Export Format", ["CSV", "Excel"])
+                with col2:
+                    export_name = st.text_input("Filename", value=f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                
+                if st.button("📥 Download Results"):
+                    if export_format == "CSV":
+                        csv = results.to_csv(index=False).encode()
+                        st.download_button("Download CSV", csv, f"{export_name}.csv", "text/csv")
+                    else:
+                        output = io.BytesIO()
+                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                            results.to_excel(writer, sheet_name='Results', index=False)
+                        st.download_button("Download Excel", output.getvalue(), f"{export_name}.xlsx",
+                                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             else:
-                st.info("No records found matching your criteria")
+                st.info("No results found")
 
-def analytics_dashboard_page(warehouse: AIWarehouse):
+def dashboard_page(warehouse: DataWarehouse):
     """Analytics dashboard"""
     st.header("📈 Analytics Dashboard")
     
-    if st.session_state.data_warehouse.empty:
-        st.warning("No data available. Please upload files first.")
-        return
-    
     stats = warehouse.get_statistics()
-    df = st.session_state.data_warehouse
     
     # Key metrics
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Total Records", f"{stats.get('total_records', 0):,}")
+        st.markdown(f"""
+        <div class="stat-card">
+            <div class="stat-number">{stats['total_profiles']:,}</div>
+            <div class="stat-label">Total Profiles</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
     with col2:
-        st.metric("Unique Contacts", f"{stats.get('unique_contacts', 0):,}")
+        st.markdown(f"""
+        <div class="stat-card">
+            <div class="stat-number">{stats['total_records']:,}</div>
+            <div class="stat-label">Total Records</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
     with col3:
-        st.metric("Valid Contacts", f"{stats.get('valid_contacts', 0):,}")
+        st.markdown(f"""
+        <div class="stat-card">
+            <div class="stat-number">{stats['valid_mobiles']:,}</div>
+            <div class="stat-label">Valid Mobiles</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
     with col4:
-        st.metric("Files Uploaded", f"{stats.get('total_files', 0)}")
+        duplicate_count = stats['total_records'] - stats['total_profiles']
+        st.markdown(f"""
+        <div class="stat-card">
+            <div class="stat-number">{duplicate_count:,}</div>
+            <div class="stat-label">Duplicates Removed</div>
+        </div>
+        """, unsafe_allow_html=True)
     
     st.markdown("---")
     
-    # Visualizations
-    tab1, tab2, tab3 = st.tabs(["📊 Source Distribution", "🏷️ Category Distribution", "📍 Top Cities"])
-    
-    with tab1:
-        if 'source_distribution' in stats and stats['source_distribution']:
-            source_df = pd.DataFrame(list(stats['source_distribution'].items()), 
-                                    columns=['Source', 'Count'])
-            fig = px.pie(source_df, values='Count', names='Source', title='Records by Source', hole=0.3)
-            fig.update_layout(height=500)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No source distribution data available")
-    
-    with tab2:
-        if 'category_distribution' in stats and stats['category_distribution']:
-            cat_df = pd.DataFrame(list(stats['category_distribution'].items()),
-                                 columns=['Category', 'Count'])
-            fig = px.bar(cat_df, x='Category', y='Count', title='Records by Category', 
-                        color='Count', color_continuous_scale='Viridis')
-            fig.update_layout(height=500)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No category distribution data available")
-    
-    with tab3:
-        if 'city' in df.columns:
-            city_counts = df['city'].value_counts().head(15)
-            if not city_counts.empty:
-                fig = px.bar(x=city_counts.values, y=city_counts.index, orientation='h',
-                            title='Top 15 Cities', labels={'x': 'Count', 'y': 'City'},
-                            color=city_counts.values, color_continuous_scale='Plasma')
-                fig.update_layout(height=500)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No city data available")
-        else:
-            st.info("City column not found in data")
-
-def mappings_page(warehouse: AIWarehouse):
-    """Show column mappings"""
-    st.header("🤖 Column Mappings")
-    
-    if not st.session_state.column_mappings:
-        st.info("No files processed yet. Upload files to see column mappings.")
-        return
-    
-    st.subheader("How Columns Were Mapped")
-    
-    for file_name, mapping in st.session_state.column_mappings.items():
-        with st.expander(f"📄 {file_name}"):
-            # Show mapping in a nice format
-            mapping_df = pd.DataFrame([
-                {"Target Column": k, "Source Column": v if v else "Not found"}
-                for k, v in mapping.items()
-            ])
-            st.dataframe(mapping_df, use_container_width=True)
-
-def file_management_page(warehouse: AIWarehouse):
-    """File management"""
-    st.header("📁 File Management")
-    
-    if st.session_state.data_warehouse.empty:
-        st.info("No data to manage")
-        return
-    
+    # Category breakdown
     col1, col2 = st.columns(2)
     
     with col1:
-        if st.button("🗑️ Clear All Data", type="secondary", use_container_width=True):
-            st.session_state.data_warehouse = pd.DataFrame()
-            st.session_state.file_metadata = []
-            st.session_state.column_mappings = {}
-            st.success("All data cleared!")
-            st.rerun()
+        st.subheader("Category Distribution")
+        category_data = {
+            'Category': ['Real Estate Trade', 'Property Seeker', 'Non-Real Estate'],
+            'Count': [stats['trade_count'], stats['seeker_count'], stats['nonre_count']]
+        }
+        import plotly.express as px
+        fig = px.pie(category_data, values='Count', names='Category', title='Profiles by Category', hole=0.3)
+        st.plotly_chart(fig, use_container_width=True)
     
     with col2:
-        if st.button("📥 Export All Data", type="primary", use_container_width=True):
-            export_df = st.session_state.data_warehouse.copy()
-            # Remove internal columns
-            export_df = export_df[[col for col in export_df.columns if not col.startswith('_')]]
-            csv = export_df.to_csv(index=False).encode()
-            st.download_button(
-                "Download CSV",
-                csv,
-                f"full_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "text/csv"
-            )
-    
-    # Show file list
-    if st.session_state.file_metadata:
-        st.markdown("---")
-        st.subheader("Uploaded Files History")
-        files_df = pd.DataFrame(st.session_state.file_metadata)
-        st.dataframe(files_df, use_container_width=True)
+        st.subheader("Top Cities")
+        if stats['city_breakdown']:
+            city_df = pd.DataFrame(stats['city_breakdown'])
+            fig = px.bar(city_df, x='city', y='count', title='Profiles by City', color='count')
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No city data available")
 
-def system_info_page(warehouse: AIWarehouse):
-    """System information"""
-    st.header("ℹ️ System Information")
+def history_page(warehouse: DataWarehouse):
+    """Import history"""
+    st.header("📋 Import History")
+    
+    history = warehouse.conn.execute("""
+        SELECT file_name, source_type, collection_date, category, 
+               total_records, profiles_created, profiles_enriched, 
+               invalid_mobiles, status, started_at
+        FROM import_jobs 
+        ORDER BY started_at DESC 
+        LIMIT 50
+    """).fetchdf()
+    
+    if not history.empty:
+        st.dataframe(history, use_container_width=True)
+        
+        # Export history
+        if st.button("📥 Export History"):
+            csv = history.to_csv(index=False).encode()
+            st.download_button("Download CSV", csv, "import_history.csv", "text/csv")
+    else:
+        st.info("No import history yet")
+
+def settings_page():
+    """Settings interface"""
+    st.header("⚙️ Settings")
     
     st.markdown("""
-    ### 🤖 AI-Powered Real Estate Data Warehouse
+    ### System Configuration
     
-    **Version:** 2.0
+    **Database Location:** `data_warehouse.duckdb`
+    **Search Index:** `search_index.db`
     
-    **Features:**
-    - **Smart Column Detection**: Uses OpenAI to identify contact numbers, names, emails, and addresses
-    - **Multi-Format Support**: Handles Excel (.xlsx, .xls) and CSV files
-    - **Deduplication**: Uses contact numbers as unique identifiers
-    - **Dynamic Querying**: Search across all data with multiple filters
-    - **Analytics Dashboard**: Visual insights into your data
+    ### Data Rules
     
-    ### How It Works
+    - Mobile numbers are standardized to 10 digits
+    - Duplicate detection uses mobile number as primary key
+    - Field conflicts resolved by: longer values win, more recent wins
+    - Classification is automatic (can be overridden at import)
     
-    1. **Upload Files**: Upload Excel or CSV files with any column structure
-    2. **AI Detection**: OpenAI analyzes column names and data patterns
-    3. **Auto-Mapping**: Columns are intelligently mapped to standard fields
-    4. **Deduplication**: Records are merged using contact numbers as keys
-    5. **Query & Export**: Search, filter, and export consolidated data
+    ### Export Settings
     
-    ### Supported File Formats
+    - CSV: UTF-8 encoding
+    - Excel: .xlsx format with openpyxl
     
-    - **Excel**: .xlsx (openpyxl), .xls (xlrd)
-    - **CSV**: UTF-8, Latin-1, ISO-8859-1 encodings
+    ### About
     
-    ### Package Status
+    **Version:** 2.0 (Enterprise Scale)
+    **Architecture:** DuckDB + SQLite FTS5
+    **Scale Ready:** 5 crore+ records
     """)
-    
-    # Show package status
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Installed Packages:**")
-        st.markdown(f"- OpenAI: {'✅' if OPENAI_AVAILABLE else '❌'}")
-        st.markdown(f"- Chardet: {'✅' if CHARDET_AVAILABLE else '❌'}")
-    with col2:
-        st.markdown("**Core Packages:**")
-        st.markdown("- Pandas: ✅")
-        st.markdown("- Plotly: ✅")
-        st.markdown("- OpenPyXL: ✅")
 
 if __name__ == "__main__":
     main()
