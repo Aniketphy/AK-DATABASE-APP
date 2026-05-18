@@ -78,15 +78,15 @@ if 'query_history' not in st.session_state:
     st.session_state.query_history = []
 if 'column_mappings' not in st.session_state:
     st.session_state.column_mappings = {}
-if 'claude_client' not in st.session_state:
-    st.session_state.claude_client = None
+if 'openai_client' not in st.session_state:
+    st.session_state.openai_client = None
 if 'processing_queue' not in st.session_state:
     st.session_state.processing_queue = []
 if 'failed_files' not in st.session_state:
     st.session_state.failed_files = []
 
 class AIDataProcessor:
-    """AI-powered data processing with Claude API"""
+    """AI-powered data processing with OpenAI API"""
     
     def __init__(self, api_key: str = None):
         self.client = None
@@ -109,7 +109,7 @@ class AIDataProcessor:
             return ""
     
     def detect_columns_with_ai(self, df: pd.DataFrame, file_name: str, target_columns: List[str]) -> Dict[str, str]:
-        """Use Claude AI to intelligently detect column mappings"""
+        """Use OpenAI to intelligently detect column mappings"""
         if not self.client:
             return self.fallback_column_detection(df, target_columns)
         
@@ -130,7 +130,7 @@ class AIDataProcessor:
             
             columns_info = {col: str(df[col].dtype) for col in df.columns}
             
-            # Create prompt for Claude
+            # Create prompt for OpenAI
             prompt = f"""You are an AI assistant helping to map columns in a real estate data file.
 
 File Name: {file_name}
@@ -161,7 +161,7 @@ Return ONLY the JSON mapping, no other text."""
 
             # Call OpenAI API
             response = self.client.chat.completions.create(
-                model="gpt-4",  # or "gpt-3.5-turbo" for faster/cheaper
+                model=st.session_state.get('openai_model', 'gpt-3.5-turbo'),
                 max_tokens=1000,
                 temperature=0,
                 messages=[
@@ -169,7 +169,7 @@ Return ONLY the JSON mapping, no other text."""
                     {"role": "user", "content": prompt}
                 ]
             )
-
+            
             # Parse OpenAI response
             response_text = response.choices[0].message.content
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
@@ -307,7 +307,7 @@ class AIWarehouse:
     """AI-powered data warehouse"""
     
     def __init__(self):
-        api_key = st.session_state.get('claude_api_key')
+        api_key = st.session_state.get('openai_api_key')
         self.ai_processor = AIDataProcessor(api_key)
         self.data = st.session_state.data_warehouse
         self.primary_key = 'contact'
@@ -406,6 +406,8 @@ class AIWarehouse:
             # Merge with existing warehouse
             if st.session_state.data_warehouse.empty:
                 st.session_state.data_warehouse = df
+                records_added = len(df)
+                records_skipped = 0
             else:
                 # Get existing contacts
                 existing_contacts = set(st.session_state.data_warehouse['contact'].tolist())
@@ -421,19 +423,18 @@ class AIWarehouse:
                 
                 records_added = len(new_records)
                 records_skipped = len(df) - records_added
-            }
             
             file_info = {
                 'file_name': file_obj.name,
-                'records_added': len(df) if st.session_state.data_warehouse.empty else records_added,
-                'records_skipped': 0 if st.session_state.data_warehouse.empty else records_skipped,
+                'records_added': records_added,
+                'records_skipped': records_skipped,
                 'column_mapping': column_mapping,
                 'upload_date': metadata.get('upload_date', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
                 'source_type': metadata.get('source_type', 'Unknown'),
                 'category': metadata.get('category', 'Uncategorized')
             }
             
-            return True, f"Successfully added {file_info['records_added']} records", file_info
+            return True, f"Successfully added {records_added} records", file_info
             
         except Exception as e:
             return False, f"Error: {str(e)}", {}
@@ -510,12 +511,20 @@ def main():
     with st.sidebar:
         st.title("⚙️ Configuration")
         
-        api_key = st.text_input("OpenAI API Key (Optional)", type="password", 
-                                help="Enter your Claude API key for enhanced AI column detection")
+        api_key = st.text_input("OpenAI API Key", type="password", 
+                                help="Enter your OpenAI API key for AI-powered column detection")
         
         if api_key:
-            st.session_state.claude_api_key = api_key
+            st.session_state.openai_api_key = api_key
             st.success("✅ OpenAI Ready!")
+        
+        # Model selection
+        if api_key:
+            st.session_state.openai_model = st.selectbox(
+                "OpenAI Model",
+                ["gpt-4", "gpt-4-turbo-preview", "gpt-3.5-turbo"],
+                index=2  # Default to gpt-3.5-turbo for cost efficiency
+            )
         
         st.markdown("---")
         st.title("📊 Navigation")
@@ -856,7 +865,7 @@ def system_info_page(warehouse: AIWarehouse):
     **Version:** 2.0
     
     **Features:**
-    - **Smart Column Detection**: Automatically identifies contact numbers, names, emails, and addresses
+    - **Smart Column Detection**: Uses OpenAI to identify contact numbers, names, emails, and addresses
     - **Multi-Format Support**: Handles Excel (.xlsx, .xls) and CSV files
     - **Deduplication**: Uses contact numbers as unique identifiers
     - **Dynamic Querying**: Search across all data with multiple filters
@@ -865,14 +874,21 @@ def system_info_page(warehouse: AIWarehouse):
     ### How It Works
     
     1. **Upload Files**: Upload Excel or CSV files with any column structure
-    2. **Auto-Detection**: System identifies contact numbers, names, emails, etc.
-    3. **Deduplication**: Records are merged using contact numbers as keys
-    4. **Query & Export**: Search, filter, and export consolidated data
+    2. **AI Detection**: OpenAI analyzes column names and data patterns
+    3. **Auto-Mapping**: Columns are intelligently mapped to standard fields
+    4. **Deduplication**: Records are merged using contact numbers as keys
+    5. **Query & Export**: Search, filter, and export consolidated data
     
-    ### File Format Support
+    ### Supported File Formats
     
     - **Excel**: .xlsx (openpyxl), .xls (xlrd)
     - **CSV**: UTF-8, Latin-1, ISO-8859-1 encodings
+    
+    ### OpenAI Integration
+    
+    - Uses GPT models for intelligent column detection
+    - Falls back to rule-based detection if API fails
+    - No data is sent to OpenAI (only column names and sample data types)
     
     ### Data Privacy
     
