@@ -429,59 +429,50 @@ class DataWarehouse:
         }
     
         try:
-            # Check if file is empty first
+            # Check if file is empty
             if file_obj.size == 0:
                 result['message'] = "File is empty - skipping"
-                result['success'] = True  # Not an error, just skip
+                result['success'] = True
                 return result
         
-            # Read file with multiple fallback strategies for Excel files
+            # Read file with multiple strategies
             df = None
+            file_content = file_obj.read()
+            file_obj.seek(0)
         
             # For .xls files (old Excel format)
             if file_obj.name.endswith('.xls'):
                 try:
-                    # Try with xlrd engine first
-                    df = pd.read_excel(file_obj, engine='xlrd')
+                    # Try with xlrd engine first (best for old .xls)
+                    import xlrd
+                    df = pd.read_excel(io.BytesIO(file_content), engine='xlrd')
                 except:
                     try:
-                        # Try with openpyxl (sometimes works)
-                        file_obj.seek(0)
-                        df = pd.read_excel(file_obj, engine='openpyxl')
+                        # Try with openpyxl
+                        df = pd.read_excel(io.BytesIO(file_content), engine='openpyxl')
                     except:
                         try:
-                            # Try reading as CSV with different encodings
-                            file_obj.seek(0)
-                            content = file_obj.read()
-                            file_obj.seek(0)
-                            # Try UTF-8
-                            try:
-                                df = pd.read_csv(io.BytesIO(content), encoding='utf-8', on_bad_lines='skip')
-                            except:
-                                # Try latin-1
-                                df = pd.read_csv(io.BytesIO(content), encoding='latin-1', on_bad_lines='skip')
+                            # Try reading raw bytes with pandas
+                            df = pd.read_excel(io.BytesIO(file_content), engine=None)
                         except:
                             pass
         
             # For .xlsx files
             elif file_obj.name.endswith('.xlsx'):
                 try:
-                    df = pd.read_excel(file_obj, engine='openpyxl')
+                    df = pd.read_excel(io.BytesIO(file_content), engine='openpyxl')
                 except:
                     try:
-                        file_obj.seek(0)
-                        df = pd.read_excel(file_obj, engine='xlrd')
+                        df = pd.read_excel(io.BytesIO(file_content), engine='xlrd')
                     except:
                         pass
         
             # For CSV files
             else:
-                # Try different encodings
                 encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']
                 for encoding in encodings:
                     try:
-                        file_obj.seek(0)
-                        df = pd.read_csv(file_obj, encoding=encoding, on_bad_lines='skip')
+                        df = pd.read_csv(io.BytesIO(file_content), encoding=encoding, on_bad_lines='skip')
                         if df is not None and not df.empty:
                             break
                     except:
@@ -491,61 +482,57 @@ class DataWarehouse:
                 result['message'] = "Could not read file or file is empty"
                 return result
         
-            # Clean column names
-            df.columns = [str(col).strip() for col in df.columns]
+            # Check if this is a valid lead file (not a tracker/meeting file)
+            # Look for patterns that indicate it's NOT a lead file
+            first_rows = df.head(10).astype(str).values.flatten()
+            first_rows_str = ' '.join([str(x).lower() for x in first_rows])
         
-            # Enhanced mobile column detection - check multiple strategies
+            # Skip tracker/meeting files
+            skip_keywords = ['calls', 'cp meetings', 'cp orientation', 'site visit', 'meeting date', 
+                        'firm name', 'person name', 'team size', 'rm name', 'remarks',
+                        'cp firm name', 'contact person', 'meeting status', 'follow up call']
+        
+            is_tracker_file = any(keyword in first_rows_str for keyword in skip_keywords)
+        
+            if is_tracker_file:
+                result['message'] = "Skipped - This appears to be a meeting tracker or CP management file, not a lead file"
+                result['success'] = True  # Not an error, just skip silently
+                return result
+        
+            # Find mobile column by checking multiple patterns
             mobile_col = None
+            mobile_patterns = ['mobile', 'phone', 'contact', 'mobile_number', 'phone_number', 
+                          'mobileno', 'contactno', 'mobile no', 'phone no']
         
-            # Strategy 1: Check column names for mobile keywords
-            mobile_keywords = ['mobile', 'phone', 'contact', 'cell', 'mob', 'telephone', 
-                          'whatsapp', 'ph', 'mobile no', 'phone no', 'contact no']
-        
+            # First check column names
             for col in df.columns:
-                col_lower = str(col).lower()
-                for keyword in mobile_keywords:
-                    if keyword in col_lower:
+                col_lower = str(col).lower().replace('_', ' ').replace('.', '')
+                for pattern in mobile_patterns:
+                    if pattern in col_lower:
                         mobile_col = col
                         break
                 if mobile_col:
                     break
         
-            # Strategy 2: Check data patterns if no column name found
+            # If not found by name, check data patterns
             if not mobile_col:
                 for col in df.columns:
-                    try:
-                        # Check first 50 non-null values
-                        sample = df[col].dropna().head(50).astype(str)
-                        # Look for 10-digit patterns
-                        if sample.str.match(r'^[0-9]{10}$').any():
-                            mobile_col = col
-                            break
-                        # Look for 12-digit patterns (with country code)
-                        if sample.str.match(r'^[0-9]{12}$').any():
-                            mobile_col = col
-                            break
-                        # Look for numbers with spaces/dashes
-                        if sample.str.replace(r'[\s\-\(\)]', '', regex=True).str.match(r'^[0-9]{10}$').any():
-                            mobile_col = col
-                            break
-                    except:
-                        continue
-        
-            # Strategy 3: Check first row for mobile-like values
-            if not mobile_col and len(df) > 0:
-                for col in df.columns:
-                    try:
-                        first_val = str(df[col].iloc[0])
-                        digits = ''.join(filter(str.isdigit, first_val))
-                        if len(digits) == 10 and digits[0] in '6789':
-                            mobile_col = col
-                            break
-                    except:
-                        continue
+                    # Sample first 30 non-null values
+                    sample = df[col].dropna().head(30).astype(str)
+                    # Check for Indian mobile number pattern (10 digits starting with 6/7/8/9)
+                    if sample.str.match(r'^[6-9][0-9]{9}$').any():
+                        mobile_col = col
+                        break
+                    # Check with +91 prefix
+                    if sample.str.match(r'^\+91[6-9][0-9]{9}$').any():
+                        mobile_col = col
+                        break
+                    # Check with 91 prefix
+                    if sample.str.match(r'^91[6-9][0-9]{9}$').any():
+                        mobile_col = col
+                        break
         
             if not mobile_col:
-                # Log available columns for debugging
-                st.warning(f"Available columns in {file_obj.name}: {list(df.columns)}")
                 result['message'] = f"No mobile number column detected. Available columns: {list(df.columns)[:5]}"
                 return result
         
@@ -560,86 +547,66 @@ class DataWarehouse:
                     result['invalid_mobiles'] += 1
                     continue
             
-                # Build record dict - try to find name, email, address columns
+                # Find name column (try common patterns)
                 name_col = None
-                email_col = None
-                address_col = None
-                city_col = None
-            
-                # Find name column
                 for col in df.columns:
                     col_lower = str(col).lower()
-                    if 'name' in col_lower or 'full_name' in col_lower or 'customer' in col_lower:
+                    if 'name' in col_lower or 'full_name' in col_lower or 'person' in col_lower:
                         name_col = col
                         break
             
                 # Find email column
+                email_col = None
                 for col in df.columns:
                     col_lower = str(col).lower()
                     if 'email' in col_lower or 'mail' in col_lower:
                         email_col = col
                         break
             
-                # Find address column
-                for col in df.columns:
-                    col_lower = str(col).lower()
-                    if 'address' in col_lower or 'addr' in col_lower or 'location' in col_lower:
-                        address_col = col
-                        break
-            
                 # Find city column
+                city_col = None
                 for col in df.columns:
                     col_lower = str(col).lower()
-                    if col_lower == 'city' or col_lower == 'town' or col_lower == 'district':
+                    if col_lower == 'city' or col_lower == 'town':
                         city_col = col
                         break
             
                 record = {
                     'mobile': mobile,
-                    'name': row[name_col] if name_col and name_col in row else '',
-                    'email': row[email_col] if email_col and email_col in row else '',
-                    'address': row[address_col] if address_col and address_col in row else '',
-                    'city': row[city_col] if city_col and city_col in row else '',
+                    'name': row[name_col] if name_col and name_col in row and pd.notna(row[name_col]) else '',
+                    'email': row[email_col] if email_col and email_col in row and pd.notna(row[email_col]) else '',
+                    'address': '',
+                    'city': row[city_col] if city_col and city_col in row and pd.notna(row[city_col]) else '',
                     'pincode': '',
                     'bhk_preference': '',
                     'budget_range': '',
                     'date_collected': metadata.get('collection_date', datetime.now().strftime("%Y-%m-%d"))
                 }
             
-                # Also check for any column that might contain these fields by value inspection
-                for col in df.columns:
-                    if col not in [name_col, email_col, address_col, city_col, mobile_col]:
-                        try:
-                            val = str(row[col])
-                            # Check if looks like email
-                            if '@' in val and not record['email']:
-                                record['email'] = val
-                            # Check if looks like pincode (6 digits)
-                            elif len(val) == 6 and val.isdigit() and not record['pincode']:
-                                record['pincode'] = val
-                            # Check if looks like BHK
-                            elif 'bhk' in val.lower() and not record['bhk_preference']:
-                                record['bhk_preference'] = val
-                        except:
-                            pass
-            
-                # Clean up None values
-                for key in record:
-                    if record[key] is None or pd.isna(record[key]):
-                        record[key] = ''
-                    elif isinstance(record[key], float) and record[key] != record[key]:  # NaN check
-                        record[key] = ''
+                # Also check for city in address column if city not found
+                if not record['city']:
+                    for col in df.columns:
+                        if 'address' in str(col).lower() or 'addr' in str(col).lower():
+                            if pd.notna(row[col]):
+                                # Try to extract city from address
+                                address_str = str(row[col])
+                                # Common cities in Maharashtra
+                                cities = ['Pune', 'Mumbai', 'Nagpur', 'Nashik', 'Aurangabad', 
+                                     'Solapur', 'Kolhapur', 'Thane', 'Pimpri', 'Chinchwad']
+                                for city in cities:
+                                    if city.lower() in address_str.lower():
+                                        record['city'] = city
+                                        break
+                            break
             
                 # Check if profile exists
                 cursor = self.conn.execute("SELECT profile_id FROM profiles WHERE mobile = ?", (mobile,))
                 existing = cursor.fetchone()
             
                 if existing:
-                    # Enrich existing profile
                     self.merge_profile(existing[0], record, file_obj.name, 'ACTUAL')
                     result['profiles_enriched'] += 1
                 else:
-                    # Create new profile
                     profile_id = self.create_profile(record, file_obj.name, 
                                                  metadata.get('source_type', 'Unknown'),
                                                  metadata.get('category', 'Let system decide'),
@@ -655,9 +622,7 @@ class DataWarehouse:
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
             self.conn.execute("""
-                INSERT INTO import_jobs VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )
+                INSERT INTO import_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (job_id, file_obj.name, metadata.get('source_type'), metadata.get('collection_date'),
                   metadata.get('category'), metadata.get('geographic_coverage'), metadata.get('quality_notes'),
                   metadata.get('file_label'), 'COMPLETE', result['total_records'], result['total_records'],
