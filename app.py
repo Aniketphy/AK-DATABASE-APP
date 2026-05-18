@@ -14,7 +14,7 @@ import base64
 from typing import Dict, List, Any, Optional, Tuple
 import warnings
 from collections import defaultdict
-import anthropic
+import openai
 import openpyxl
 import xlrd
 from io import BytesIO
@@ -92,7 +92,7 @@ class AIDataProcessor:
         self.client = None
         if api_key:
             try:
-                self.client = anthropic.Anthropic(api_key=api_key)
+                self.client = openai.OpenAI(api_key=api_key)
             except Exception as e:
                 pass
     
@@ -159,18 +159,19 @@ Important rules:
 
 Return ONLY the JSON mapping, no other text."""
 
-            # Call Claude API
-            message = self.client.messages.create(
-                model="claude-3-sonnet-20240229",
+            # Call OpenAI API
+            response = self.client.chat.completions.create(
+                model="gpt-4",  # or "gpt-3.5-turbo" for faster/cheaper
                 max_tokens=1000,
                 temperature=0,
                 messages=[
+                    {"role": "system", "content": "You are an AI assistant helping to map columns in a real estate data file. Return only valid JSON."},
                     {"role": "user", "content": prompt}
                 ]
             )
-            
-            # Parse AI response
-            response_text = message.content[0].text
+
+            # Parse OpenAI response
+            response_text = response.choices[0].message.content
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
                 mapping = json.loads(json_match.group())
@@ -509,12 +510,12 @@ def main():
     with st.sidebar:
         st.title("⚙️ Configuration")
         
-        api_key = st.text_input("Claude API Key (Optional)", type="password", 
+        api_key = st.text_input("OpenAI API Key (Optional)", type="password", 
                                 help="Enter your Claude API key for enhanced AI column detection")
         
         if api_key:
             st.session_state.claude_api_key = api_key
-            st.success("✅ AI Ready!")
+            st.success("✅ OpenAI Ready!")
         
         st.markdown("---")
         st.title("📊 Navigation")
