@@ -14,13 +14,15 @@ import base64
 from typing import Dict, List, Any, Optional, Tuple
 import warnings
 from collections import defaultdict
-import random
-import string
+import anthropic
+import openpyxl
+import xlrd
+from io import BytesIO
 warnings.filterwarnings('ignore')
 
 # Page configuration
 st.set_page_config(
-    page_title="Real Estate Data Warehouse - Multi-File Query System",
+    page_title="AI-Powered Real Estate Data Warehouse",
     page_icon="🏠",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -54,19 +56,14 @@ st.markdown("""
         font-size: 0.9rem;
         opacity: 0.9;
     }
-    .query-builder {
-        background-color: #f8f9fa;
-        padding: 1.5rem;
-        border-radius: 10px;
-        border: 2px solid #e9ecef;
-        margin: 1rem 0;
-    }
-    .privacy-note {
-        background-color: #e3f2fd;
-        padding: 1rem;
-        border-radius: 10px;
-        border-left: 4px solid #2196f3;
-        margin: 1rem 0;
+    .ai-badge {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 0.25rem 0.75rem;
+        border-radius: 20px;
+        color: white;
+        font-size: 0.8rem;
+        display: inline-block;
+        margin-left: 0.5rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -78,155 +75,265 @@ if 'file_metadata' not in st.session_state:
     st.session_state.file_metadata = []
 if 'query_history' not in st.session_state:
     st.session_state.query_history = []
-if 'primary_key_column' not in st.session_state:
-    st.session_state.primary_key_column = None
-if 'available_columns' not in st.session_state:
-    st.session_state.available_columns = set()
+if 'column_mappings' not in st.session_state:
+    st.session_state.column_mappings = {}
+if 'claude_client' not in st.session_state:
+    st.session_state.claude_client = None
+if 'processing_queue' not in st.session_state:
+    st.session_state.processing_queue = []
 
-class PrivacyCompliantDataWarehouse:
-    """
-    Data warehouse that respects privacy while enabling powerful querying
-    Uses any column as primary key (mobile, email, ID, etc.) without exposing data
-    """
+class AIDataProcessor:
+    """AI-powered data processing with Claude API"""
+    
+    def __init__(self, api_key: str = None):
+        self.client = None
+        if api_key:
+            try:
+                self.client = anthropic.Anthropic(api_key=api_key)
+                st.success("🤖 AI Assistant Ready!")
+            except Exception as e:
+                st.warning(f"AI setup: {str(e)}")
+    
+    def detect_columns_with_ai(self, df: pd.DataFrame, file_name: str, target_columns: List[str]) -> Dict[str, str]:
+        """Use Claude AI to intelligently detect column mappings"""
+        if not self.client:
+            return self.fallback_column_detection(df, target_columns)
+        
+        try:
+            # Prepare sample data for AI
+            sample_data = df.head(10).to_dict('records')
+            columns_info = {col: str(df[col].dtype) for col in df.columns}
+            
+            # Create prompt for Claude
+            prompt = f"""You are an AI assistant helping to map columns in a real estate data file.
+
+File Name: {file_name}
+
+Available columns in the file:
+{json.dumps(columns_info, indent=2)}
+
+Sample data (first 5 rows):
+{json.dumps(sample_data[:5], indent=2, default=str)}
+
+Target columns to map:
+{json.dumps(target_columns, indent=2)}
+
+Please analyze the column names and sample data to determine which existing columns correspond to each target column.
+Return a JSON object mapping target columns to actual column names in the file.
+If a target column cannot be mapped, map it to null.
+Consider:
+1. Column name similarity (case-insensitive, partial matches)
+2. Data patterns (phone numbers, emails, names, etc.)
+3. Common variations (mobile/phone/contact, name/full_name, etc.)
+4. Data types and formats
+
+Return ONLY the JSON mapping, no other text."""
+
+            # Call Claude API
+            message = self.client.messages.create(
+                model="claude-3-sonnet-20240229",
+                max_tokens=1000,
+                temperature=0,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            
+            # Parse AI response
+            response_text = message.content[0].text
+            # Extract JSON from response
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                mapping = json.loads(json_match.group())
+                return mapping
+            else:
+                return self.fallback_column_detection(df, target_columns)
+                
+        except Exception as e:
+            st.warning(f"AI detection failed: {str(e)}. Using fallback method.")
+            return self.fallback_column_detection(df, target_columns)
+    
+    def fallback_column_detection(self, df: pd.DataFrame, target_columns: List[str]) -> Dict[str, str]:
+        """Fallback column detection using rules"""
+        mapping = {}
+        column_lower = {col: col.lower() for col in df.columns}
+        
+        # Comprehensive mapping rules
+        mapping_rules = {
+            'contact': ['contact', 'mobile', 'phone', 'cell', 'mob', 'telephone', 'whatsapp', 'ph', 'phone number', 'contact number'],
+            'name': ['name', 'full name', 'customer name', 'client name', 'party name', 'buyer name', 'seller name', 'lead name'],
+            'email': ['email', 'e-mail', 'mail', 'email id', 'email address', 'mail id'],
+            'address': ['address', 'addr', 'location', 'locality', 'area', 'street', 'full address', 'property address'],
+            'city': ['city', 'town', 'district', 'location city'],
+            'state': ['state', 'province', 'region', 'state name'],
+            'pincode': ['pincode', 'pin', 'zip', 'postal', 'zipcode', 'postal code', 'pin code'],
+            'source': ['source', 'lead source', 'data source', 'origin'],
+            'category': ['category', 'type', 'classification', 'segment']
+        }
+        
+        for target in target_columns:
+            if target in mapping_rules:
+                for rule in mapping_rules[target]:
+                    for col, col_lower in column_lower.items():
+                        if rule in col_lower:
+                            mapping[target] = col
+                            break
+                    if target in mapping:
+                        break
+            
+            # If not found, try data pattern detection
+            if target not in mapping and target == 'contact':
+                for col in df.columns:
+                    sample = df[col].head(20).astype(str)
+                    # Check for phone number pattern
+                    if sample.str.match(r'^[0-9]{10}$').any() or sample.str.match(r'^[0-9]{12}$').any():
+                        mapping[target] = col
+                        break
+            
+            # If still not found, set to null
+            if target not in mapping:
+                mapping[target] = None
+        
+        return mapping
+    
+    def fix_excel_engine(self, file_obj) -> pd.DataFrame:
+        """Intelligently read Excel files with correct engine"""
+        try:
+            # Try reading with default engine
+            if file_obj.name.endswith('.xls'):
+                # For older .xls files
+                df = pd.read_excel(file_obj, engine='xlrd')
+            else:
+                # For .xlsx files
+                df = pd.read_excel(file_obj, engine='openpyxl')
+            return df
+        except Exception as e:
+            try:
+                # Try alternative engine
+                if file_obj.name.endswith('.xls'):
+                    df = pd.read_excel(file_obj, engine='openpyxl')
+                else:
+                    df = pd.read_excel(file_obj, engine='xlrd')
+                return df
+            except:
+                # If both fail, try reading with raw data
+                file_obj.seek(0)
+                df = pd.read_excel(file_obj, engine=None)
+                return df
+
+class AIWarehouse:
+    """AI-powered data warehouse"""
     
     def __init__(self):
+        self.ai_processor = AIDataProcessor(st.session_state.get('claude_api_key'))
         self.data = st.session_state.data_warehouse
-        self.pk_column = st.session_state.primary_key_column
+        self.primary_key = 'contact'  # Standardized primary key
     
-    @staticmethod
-    def hash_sensitive_data(value: str) -> str:
-        """Hash sensitive data for secure storage (optional)"""
-        if pd.isna(value) or value == "":
-            return ""
-        return hashlib.sha256(str(value).encode()).hexdigest()[:16]
-    
-    def detect_primary_key_column(self, df: pd.DataFrame) -> Optional[str]:
-        """
-        Intelligently detect which column could serve as primary key
-        Based on uniqueness and data patterns, not specific values
-        """
-        candidates = []
-        
-        for col in df.columns:
-            col_lower = col.lower()
-            # Check for common identifier columns
-            if any(keyword in col_lower for keyword in ['mobile', 'phone', 'contact', 'id', 'email', 'user_id', 'client_id']):
-                # Check uniqueness
-                uniqueness = df[col].nunique() / len(df)
-                if uniqueness > 0.8:  # High uniqueness
-                    candidates.append((col, uniqueness))
-        
-        if candidates:
-            # Return the most unique column
-            return max(candidates, key=lambda x: x[1])[0]
-        
-        # If no obvious PK column, check first column for uniqueness
-        first_col = df.columns[0]
-        uniqueness = df[first_col].nunique() / len(df)
-        if uniqueness > 0.9:
-            return first_col
-        
-        return None
-    
-    def add_file(self, file_obj, metadata: Dict) -> Tuple[bool, str, Dict]:
-        """Add a file to the warehouse with flexible key column detection"""
+    def process_file_with_ai(self, file_obj, metadata: Dict) -> Tuple[bool, str, Dict]:
+        """Process file with AI-powered column detection"""
         try:
-            # Read file
-            if file_obj.name.endswith('.csv'):
-                df = pd.read_csv(file_obj)
+            # First, fix Excel engine issues
+            if file_obj.name.endswith(('.xls', '.xlsx')):
+                df = self.ai_processor.fix_excel_engine(file_obj)
             else:
-                df = pd.read_excel(file_obj)
+                df = pd.read_csv(file_obj)
             
-            # Detect or use existing primary key column
-            if not self.pk_column:
-                pk_column = self.detect_primary_key_column(df)
-                if pk_column:
-                    st.session_state.primary_key_column = pk_column
-                    self.pk_column = pk_column
-                else:
-                    # Create an artificial unique ID column
-                    df['_generated_id'] = [f"REC_{i+1}" for i in range(len(df))]
-                    st.session_state.primary_key_column = '_generated_id'
-                    self.pk_column = '_generated_id'
+            if df.empty:
+                return False, "File is empty", {}
             
-            # Ensure primary key column exists
-            if self.pk_column not in df.columns and self.pk_column != '_generated_id':
-                st.warning(f"Primary key column '{self.pk_column}' not found in {file_obj.name}")
-                return False, f"Primary key column '{self.pk_column}' not found", {}
+            # Target columns we want to map
+            target_columns = ['contact', 'name', 'email', 'address', 'city', 'state', 'pincode', 'source', 'category']
             
-            # Add metadata columns
+            # Use AI to detect column mappings
+            column_mapping = self.ai_processor.detect_columns_with_ai(df, file_obj.name, target_columns)
+            
+            # Store mapping for this file
+            st.session_state.column_mappings[file_obj.name] = column_mapping
+            
+            # Rename columns based on mapping
+            rename_dict = {v: k for k, v in column_mapping.items() if v is not None and v in df.columns}
+            if rename_dict:
+                df = df.rename(columns=rename_dict)
+            
+            # Ensure all target columns exist
+            for col in target_columns:
+                if col not in df.columns:
+                    df[col] = ""
+            
+            # Clean contact numbers (standardize to 10 digits)
+            if 'contact' in df.columns:
+                df['contact'] = df['contact'].astype(str).apply(self.clean_contact)
+                df['contact_valid'] = df['contact'].str.match(r'^[0-9]{10}$')
+            
+            # Add metadata
             df['_source_file'] = file_obj.name
             df['_upload_date'] = metadata.get('upload_date', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             df['_source_type'] = metadata.get('source_type', 'Unknown')
             df['_category'] = metadata.get('category', 'Uncategorized')
-            df['_data_quality_score'] = self.calculate_quality_score(df)
             
-            # Track all columns
-            for col in df.columns:
-                if not col.startswith('_'):
-                    st.session_state.available_columns.add(col)
-            
-            # Remove duplicates based on primary key
+            # Remove duplicates based on contact
             before_count = len(df)
-            df = df.drop_duplicates(subset=[self.pk_column], keep='first')
+            df = df.drop_duplicates(subset=['contact'], keep='first')
             after_count = len(df)
             
             # Merge with existing data
             if st.session_state.data_warehouse.empty:
                 st.session_state.data_warehouse = df
             else:
-                # Use outer join to preserve all records
+                # Use contact as key for merging
                 st.session_state.data_warehouse = pd.merge(
-                    st.session_state.data_warehouse, 
-                    df, 
-                    on=[self.pk_column], 
+                    st.session_state.data_warehouse,
+                    df,
+                    on=['contact'],
                     how='outer',
                     suffixes=('', '_new')
                 )
                 
-                # Handle duplicate columns from merge
-                for col in df.columns:
+                # Merge additional fields
+                for col in ['name', 'email', 'address', 'city', 'state', 'pincode']:
                     if f"{col}_new" in st.session_state.data_warehouse.columns:
-                        # Combine data from both sources
                         st.session_state.data_warehouse[col] = st.session_state.data_warehouse[col].fillna(
                             st.session_state.data_warehouse[f"{col}_new"]
                         )
                         st.session_state.data_warehouse.drop(columns=[f"{col}_new"], inplace=True)
             
-            # Update file metadata
             file_info = {
                 'file_name': file_obj.name,
                 'records_added': after_count,
                 'duplicates_removed': before_count - after_count,
-                'primary_key_column': self.pk_column,
-                'total_rows': len(df),
+                'column_mapping': column_mapping,
                 'upload_date': metadata.get('upload_date', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
                 'source_type': metadata.get('source_type', 'Unknown'),
                 'category': metadata.get('category', 'Uncategorized')
             }
-            st.session_state.file_metadata.append(file_info)
             
-            return True, f"Successfully added {after_count} records using key: {self.pk_column}", file_info
+            return True, f"Successfully added {after_count} records", file_info
             
         except Exception as e:
-            return False, f"Error processing file: {str(e)}", {}
+            return False, f"Error: {str(e)}", {}
     
-    def calculate_quality_score(self, df: pd.DataFrame) -> pd.Series:
-        """Calculate data quality score based on completeness"""
-        score = pd.Series([0] * len(df), index=df.index)
+    def clean_contact(self, contact: str) -> str:
+        """Clean contact number to standard 10-digit format"""
+        if pd.isna(contact) or contact == "":
+            return ""
         
-        # Award points for non-null values in important columns
-        important_columns = ['name', 'email', 'address', 'city', 'state']
-        points_per_column = 20
+        # Extract digits only
+        digits = re.sub(r'\D', '', str(contact))
         
-        for col in important_columns:
-            if col in df.columns:
-                score += df[col].notna() & (df[col] != "") * points_per_column
-        
-        return score.clip(upper=100)
+        # Standardize to 10 digits
+        if len(digits) == 10:
+            return digits
+        elif len(digits) == 11 and digits.startswith('0'):
+            return digits[1:]
+        elif len(digits) == 12 and digits.startswith('91'):
+            return digits[2:]
+        elif len(digits) == 13 and digits.startswith('091'):
+            return digits[3:]
+        else:
+            return ""
     
     def dynamic_query(self, conditions: Dict) -> pd.DataFrame:
-        """Execute dynamic query with flexible conditions"""
+        """Execute dynamic query"""
         if st.session_state.data_warehouse.empty:
             return pd.DataFrame()
         
@@ -235,41 +342,28 @@ class PrivacyCompliantDataWarehouse:
         # Apply filters
         for field, value in conditions.items():
             if field == 'search_text' and value:
-                # Search across all text columns
+                # Search across text fields
                 search_mask = pd.Series([False] * len(df))
-                for col in df.select_dtypes(include=['object']).columns:
-                    if not col.startswith('_'):
+                text_cols = ['name', 'email', 'address', 'city', 'contact']
+                for col in text_cols:
+                    if col in df.columns:
                         search_mask |= df[col].astype(str).str.lower().str.contains(value.lower(), na=False)
                 df = df[search_mask]
             
-            elif field == 'date_from' and value:
-                if '_upload_date' in df.columns:
-                    df['_upload_date_dt'] = pd.to_datetime(df['_upload_date'], errors='coerce')
-                    df = df[df['_upload_date_dt'] >= pd.to_datetime(value)]
-            
-            elif field == 'date_to' and value:
-                if '_upload_date' in df.columns:
-                    df['_upload_date_dt'] = pd.to_datetime(df['_upload_date'], errors='coerce')
-                    df = df[df['_upload_date_dt'] <= pd.to_datetime(value)]
-            
             elif field in df.columns and value and value != 'All':
-                if field in df.columns:
-                    df = df[df[field] == value]
+                df = df[df[field] == value]
             
-            elif field.startswith('_') and value and value != 'All':
-                if field in df.columns:
-                    df = df[df[field] == value]
+            elif field == 'contact' and value:
+                contact_clean = self.clean_contact(value)
+                if contact_clean:
+                    df = df[df['contact'] == contact_clean]
         
-        # Remove internal columns for display
+        # Remove internal columns
         display_cols = [col for col in df.columns if not col.startswith('_')]
-        if self.pk_column in display_cols:
-            # Ensure primary key is first column
-            display_cols.insert(0, display_cols.pop(display_cols.index(self.pk_column)))
-        
         return df[display_cols] if display_cols else df
     
     def get_statistics(self) -> Dict:
-        """Get comprehensive statistics"""
+        """Get statistics"""
         if st.session_state.data_warehouse.empty:
             return {}
         
@@ -277,9 +371,9 @@ class PrivacyCompliantDataWarehouse:
         
         stats = {
             'total_records': len(df),
+            'unique_contacts': df['contact'].nunique() if 'contact' in df.columns else 0,
             'total_files': len(st.session_state.file_metadata),
-            'primary_key_column': self.pk_column,
-            'total_columns': len([col for col in df.columns if not col.startswith('_')])
+            'valid_contacts': df['contact_valid'].sum() if 'contact_valid' in df.columns else 0
         }
         
         # Source distribution
@@ -290,49 +384,37 @@ class PrivacyCompliantDataWarehouse:
         if '_category' in df.columns:
             stats['category_distribution'] = df['_category'].value_counts().to_dict()
         
-        # Data quality
-        if '_data_quality_score' in df.columns:
-            stats['avg_quality_score'] = df['_data_quality_score'].mean()
-            stats['quality_distribution'] = {
-                'High (80-100)': len(df[df['_data_quality_score'] >= 80]),
-                'Medium (50-79)': len(df[(df['_data_quality_score'] >= 50) & (df['_data_quality_score'] < 80)]),
-                'Low (0-49)': len(df[df['_data_quality_score'] < 50])
-            }
-        
-        # Column completeness
-        completeness = {}
-        for col in df.select_dtypes(include=['object']).columns[:10]:  # Limit to first 10 columns
-            if not col.startswith('_'):
-                completeness[col] = (df[col].notna() & (df[col] != "")).mean() * 100
-        stats['column_completeness'] = completeness
-        
         return stats
 
 def main():
     """Main application"""
     
-    st.markdown('<div class="main-header">🏠 Pan-India Real Estate Data Warehouse</div>', unsafe_allow_html=True)
-    
-    # Privacy notice
-    st.markdown("""
-    <div class="privacy-note">
-        🔒 <strong>Privacy First Approach:</strong> This system uses column-based primary keys (mobile, email, ID, etc.) 
-        for data correlation without exposing or requiring specific values. All data processing happens in-memory 
-        and is not persisted outside the session.
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown('<div class="main-header">🤖 AI-Powered Real Estate Data Warehouse</div>', unsafe_allow_html=True)
     
     # Initialize warehouse
-    warehouse = PrivacyCompliantDataWarehouse()
+    warehouse = AIWarehouse()
     
-    # Sidebar
+    # API Key configuration in sidebar
     with st.sidebar:
+        st.title("⚙️ Configuration")
+        
+        # Claude API Key input
+        api_key = st.text_input("Claude API Key", type="password", 
+                                help="Enter your Claude API key for AI-powered column detection")
+        
+        if api_key:
+            st.session_state.claude_api_key = api_key
+            if not st.session_state.get('claude_client'):
+                st.session_state.claude_client = anthropic.Anthropic(api_key=api_key)
+                st.success("✅ AI Assistant Configured!")
+        
+        st.markdown("---")
         st.title("📊 Navigation")
         
         page = st.radio(
             "Select Module",
             ["📤 Upload Files", "🔍 Dynamic Query", "📈 Analytics Dashboard", 
-             "📁 Data Management", "ℹ️ System Info"],
+             "📁 File Management", "🤖 AI Column Mapping", "ℹ️ System Info"],
             index=0
         )
         
@@ -343,9 +425,6 @@ def main():
             st.markdown("### 📊 System Stats")
             st.metric("Total Records", f"{len(st.session_state.data_warehouse):,}")
             st.metric("Files Uploaded", f"{len(st.session_state.file_metadata)}")
-            
-            if st.session_state.primary_key_column:
-                st.info(f"🔑 Primary Key: **{st.session_state.primary_key_column}**")
     
     # Page routing
     if page == "📤 Upload Files":
@@ -354,21 +433,23 @@ def main():
         dynamic_query_page(warehouse)
     elif page == "📈 Analytics Dashboard":
         analytics_dashboard_page(warehouse)
-    elif page == "📁 Data Management":
-        data_management_page(warehouse)
+    elif page == "📁 File Management":
+        file_management_page(warehouse)
+    elif page == "🤖 AI Column Mapping":
+        ai_mapping_page(warehouse)
     elif page == "ℹ️ System Info":
         system_info_page(warehouse)
 
-def upload_files_page(warehouse: PrivacyCompliantDataWarehouse):
-    """Handle file uploads"""
-    st.header("📤 Upload Multiple Files")
+def upload_files_page(warehouse: AIWarehouse):
+    """Handle file uploads with AI processing"""
+    st.header("📤 Upload Files with AI Processing")
     
     st.info("""
-    💡 **How it works:**
-    - Upload multiple Excel/CSV files
-    - System automatically detects which column can serve as a unique identifier (mobile, email, ID, etc.)
-    - This identifier is used as a key to correlate records across different files
-    - No specific values are required or exposed - the system works with any column as key
+    🤖 **AI-Powered Processing:**
+    - Automatically detects column mappings using Claude AI
+    - Handles various Excel formats (.xls, .xlsx, .csv)
+    - Standardizes contact numbers to 10 digits
+    - Uses contact number as primary key for deduplication
     """)
     
     with st.form("upload_form"):
@@ -376,47 +457,42 @@ def upload_files_page(warehouse: PrivacyCompliantDataWarehouse):
         
         with col1:
             source_type = st.selectbox(
-                "Default Source Type (optional)",
-                ["Select source", "MSEB", "Facebook Leads", "Property Portal", 
+                "Source Type",
+                ["General", "MSEB", "Facebook Leads", "Property Portal", 
                  "Agent List", "School Data", "Doctor List", "Police Records",
                  "Broker List", "Expo Visitors", "Sales Data", "Other"]
             )
         
         with col2:
             category = st.selectbox(
-                "Default Category (optional)",
-                ["Select category", "Real Estate Trade", "Property Seeker", "Non-Real Estate", "General"]
+                "Category",
+                ["Real Estate Trade", "Property Seeker", "Non-Real Estate", "General"]
             )
         
         uploaded_files = st.file_uploader(
             "Choose Files (Excel or CSV)",
             type=['xlsx', 'xls', 'csv'],
             accept_multiple_files=True,
-            help="Upload any number of files. System will detect the best column to use as primary key for correlation."
+            help="Upload any number of files. AI will automatically detect column structures."
         )
         
-        submitted = st.form_submit_button("🚀 Process Files", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("🚀 Process with AI", type="primary", use_container_width=True)
         
         if submitted and uploaded_files:
-            if source_type == "Select source":
-                source_type = "General"
-            if category == "Select category":
-                category = "General"
-                
-            process_files(warehouse, uploaded_files, source_type, category)
+            process_files_with_ai(warehouse, uploaded_files, source_type, category)
 
-def process_files(warehouse: PrivacyCompliantDataWarehouse, files, source_type, category):
-    """Process multiple files"""
+def process_files_with_ai(warehouse: AIWarehouse, files, source_type, category):
+    """Process files using AI"""
     progress_bar = st.progress(0)
     status_text = st.empty()
     results_container = st.container()
     
     success_count = 0
     error_count = 0
-    total_records_added = 0
+    total_records = 0
     
     for idx, file in enumerate(files):
-        status_text.text(f"Processing {file.name}... ({idx+1}/{len(files)})")
+        status_text.text(f"🤖 AI Processing: {file.name}... ({idx+1}/{len(files)})")
         
         metadata = {
             'upload_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -424,13 +500,15 @@ def process_files(warehouse: PrivacyCompliantDataWarehouse, files, source_type, 
             'category': category
         }
         
-        success, message, file_info = warehouse.add_file(file, metadata)
+        success, message, file_info = warehouse.process_file_with_ai(file, metadata)
         
         if success:
             success_count += 1
-            total_records_added += file_info.get('records_added', 0)
+            total_records += file_info.get('records_added', 0)
             with results_container:
                 st.success(f"✅ {file.name}: {message}")
+                if 'column_mapping' in file_info:
+                    st.caption(f"📋 AI Mapping: {file_info['column_mapping']}")
         else:
             error_count += 1
             with results_container:
@@ -438,24 +516,25 @@ def process_files(warehouse: PrivacyCompliantDataWarehouse, files, source_type, 
         
         progress_bar.progress((idx + 1) / len(files))
     
-    status_text.text("✅ Processing Complete!")
+    status_text.text("✅ AI Processing Complete!")
     
     # Summary
     st.markdown("---")
-    st.subheader("📊 Upload Summary")
+    st.subheader("📊 Processing Summary")
     
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Files Processed", f"{success_count}/{len(files)}")
     with col2:
-        st.metric("Records Added", f"{total_records_added:,}")
+        st.metric("Total Records Added", f"{total_records:,}")
     with col3:
-        st.metric("Primary Key", st.session_state.primary_key_column or "Auto-detected")
+        st.metric("Primary Key", "Contact Number")
     
     if success_count > 0:
         st.balloons()
+        st.info("💡 Tip: Check the 'AI Column Mapping' page to see how AI mapped columns for each file")
 
-def dynamic_query_page(warehouse: PrivacyCompliantDataWarehouse):
+def dynamic_query_page(warehouse: AIWarehouse):
     """Dynamic query interface"""
     st.header("🔍 Dynamic Query Builder")
     
@@ -463,154 +542,78 @@ def dynamic_query_page(warehouse: PrivacyCompliantDataWarehouse):
         st.warning("No data available. Please upload files first.")
         return
     
-    st.markdown('<div class="query-builder">', unsafe_allow_html=True)
-    st.subheader("Build Your Custom Query")
-    
-    # Get available columns for filtering
-    available_columns = [col for col in st.session_state.available_columns if not col.startswith('_')]
-    available_columns.extend(['_source_type', '_category'])
+    st.markdown("### Query Your Data Warehouse")
     
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        query_type = st.selectbox(
-            "Quick Filter",
-            ["All Records", "By Source", "By Category", "Text Search", "Custom Query"]
-        )
+        search_text = st.text_input("🔍 Search Any Field", placeholder="Name, email, address...")
     
-    conditions = {}
-    
-    if query_type == "By Source":
-        if '_source_type' in st.session_state.data_warehouse.columns:
-            sources = st.session_state.data_warehouse['_source_type'].unique().tolist()
-            selected_source = st.selectbox("Select Source", ["All"] + sorted(sources))
-            if selected_source != "All":
-                conditions['_source_type'] = selected_source
-    
-    elif query_type == "By Category":
-        if '_category' in st.session_state.data_warehouse.columns:
-            categories = st.session_state.data_warehouse['_category'].unique().tolist()
-            selected_category = st.selectbox("Select Category", ["All"] + sorted(categories))
-            if selected_category != "All":
-                conditions['_category'] = selected_category
-    
-    elif query_type == "Text Search":
-        search_text = st.text_input("Search Text", placeholder="Search across all text fields...")
-        if search_text:
-            conditions['search_text'] = search_text
-    
-    elif query_type == "Custom Query":
-        st.info("Build custom query with field-specific filters")
-        
-        num_filters = st.number_input("Number of filters", min_value=1, max_value=5, value=1)
-        
-        for i in range(num_filters):
-            st.markdown(f"**Filter {i+1}**")
-            filter_col1, filter_col2 = st.columns(2)
-            
-            with filter_col1:
-                filter_field = st.selectbox(f"Field", available_columns, key=f"field_{i}")
-            
-            with filter_col2:
-                # Get unique values for the selected field
-                if filter_field in st.session_state.data_warehouse.columns:
-                    unique_values = st.session_state.data_warehouse[filter_field].dropna().unique().tolist()
-                    filter_value = st.selectbox(f"Value", ["All"] + sorted([str(v) for v in unique_values[:20]]), key=f"value_{i}")
-                    if filter_value != "All":
-                        conditions[filter_field] = filter_value
-                else:
-                    filter_value = st.text_input(f"Value", key=f"value_{i}")
-                    if filter_value:
-                        conditions[filter_field] = filter_value
-    
-    # Date range filter (always available)
-    st.markdown("---")
-    st.subheader("Date Range Filter (Optional)")
-    col1, col2 = st.columns(2)
-    with col1:
-        date_from = st.date_input("From Date", value=None)
-        if date_from:
-            conditions['date_from'] = date_from.strftime("%Y-%m-%d")
     with col2:
-        date_to = st.date_input("To Date", value=None)
-        if date_to:
-            conditions['date_to'] = date_to.strftime("%Y-%m-%d")
+        if '_source_type' in st.session_state.data_warehouse.columns:
+            sources = ['All'] + sorted(st.session_state.data_warehouse['_source_type'].unique().tolist())
+            source_filter = st.selectbox("Filter by Source", sources)
+        else:
+            source_filter = "All"
+    
+    with col3:
+        if '_category' in st.session_state.data_warehouse.columns:
+            categories = ['All'] + sorted(st.session_state.data_warehouse['_category'].unique().tolist())
+            category_filter = st.selectbox("Filter by Category", categories)
+        else:
+            category_filter = "All"
+    
+    # Specific contact search
+    st.markdown("---")
+    contact_search = st.text_input("📱 Search Specific Contact Number", placeholder="Enter 10-digit contact number")
     
     # Execute query
     if st.button("🔍 Execute Query", type="primary", use_container_width=True):
-        with st.spinner("Executing query..."):
+        conditions = {}
+        
+        if search_text:
+            conditions['search_text'] = search_text
+        if source_filter != "All":
+            conditions['_source_type'] = source_filter
+        if category_filter != "All":
+            conditions['_category'] = category_filter
+        if contact_search:
+            conditions['contact'] = contact_search
+        
+        with st.spinner("Searching..."):
             results_df = warehouse.dynamic_query(conditions)
             
-            # Save to history
-            query_record = {
-                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'query_type': query_type,
-                'conditions': str(conditions),
-                'results_count': len(results_df)
-            }
-            st.session_state.query_history.append(query_record)
-            
-            # Display results
-            st.markdown("---")
-            st.subheader(f"📊 Query Results: {len(results_df)} records found")
+            st.markdown(f"### 📊 Results: {len(results_df)} records found")
             
             if not results_df.empty:
-                # Column selector for display
-                all_cols = results_df.columns.tolist()
-                default_cols = [col for col in [st.session_state.primary_key_column, 'name', 'email', '_source_type', '_category'] 
-                              if col in all_cols]
+                # Display results
+                display_cols = ['contact', 'name', 'email', 'city', '_source_type', '_category']
+                available_cols = [col for col in display_cols if col in results_df.columns]
                 
-                selected_cols = st.multiselect(
-                    "Select columns to display",
-                    all_cols,
-                    default=default_cols[:5] if default_cols else all_cols[:5]
-                )
+                st.dataframe(results_df[available_cols], use_container_width=True, height=400)
                 
-                if selected_cols:
-                    st.dataframe(results_df[selected_cols], use_container_width=True, height=400)
-                
-                # Export options
+                # Export
                 st.markdown("---")
-                st.subheader("📥 Export Results")
+                col1, col2 = st.columns(2)
+                with col1:
+                    export_format = st.selectbox("Export Format", ["CSV", "Excel"])
+                with col2:
+                    export_name = st.text_input("Filename", value=f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
                 
-                export_format = st.selectbox("Export Format", ["CSV", "Excel", "JSON"])
-                export_name = st.text_input("Filename", value=f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-                
-                if st.button("📥 Download Results", type="primary"):
-                    export_df = results_df[selected_cols] if selected_cols else results_df
-                    
+                if st.button("📥 Download Results"):
                     if export_format == "CSV":
-                        csv = export_df.to_csv(index=False).encode()
-                        st.download_button(
-                            "Click to Download",
-                            data=csv,
-                            file_name=f"{export_name}.csv",
-                            mime="text/csv"
-                        )
-                    elif export_format == "Excel":
+                        csv = results_df.to_csv(index=False).encode()
+                        st.download_button("Download CSV", csv, f"{export_name}.csv", "text/csv")
+                    else:
                         output = io.BytesIO()
                         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                            export_df.to_excel(writer, sheet_name='Results', index=False)
-                        st.download_button(
-                            "Click to Download",
-                            data=output.getvalue(),
-                            file_name=f"{export_name}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-                    else:
-                        json_str = export_df.to_json(orient='records', indent=2)
-                        st.download_button(
-                            "Click to Download",
-                            data=json_str,
-                            file_name=f"{export_name}.json",
-                            mime="application/json"
-                        )
+                            results_df.to_excel(writer, sheet_name='Results', index=False)
+                        st.download_button("Download Excel", output.getvalue(), f"{export_name}.xlsx", 
+                                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             else:
-                st.warning("No records found matching your criteria")
-    
-    st.markdown('</div>', unsafe_allow_html=True)
+                st.info("No records found matching your criteria")
 
-def analytics_dashboard_page(warehouse: PrivacyCompliantDataWarehouse):
+def analytics_dashboard_page(warehouse: AIWarehouse):
     """Analytics dashboard"""
     st.header("📈 Analytics Dashboard")
     
@@ -622,45 +625,21 @@ def analytics_dashboard_page(warehouse: PrivacyCompliantDataWarehouse):
     df = st.session_state.data_warehouse
     
     # Key metrics
-    st.subheader("📊 Key Metrics")
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-number">{stats['total_records']:,}</div>
-            <div class="stat-label">Total Records</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
+        st.metric("Total Records", f"{stats['total_records']:,}")
     with col2:
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-number">{stats['total_files']}</div>
-            <div class="stat-label">Files Uploaded</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
+        st.metric("Unique Contacts", f"{stats['unique_contacts']:,}")
     with col3:
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-number">{stats.get('avg_quality_score', 0):.0f}</div>
-            <div class="stat-label">Avg Quality Score</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
+        st.metric("Valid Contacts", f"{stats['valid_contacts']:,}")
     with col4:
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-number">{stats['total_columns']}</div>
-            <div class="stat-label">Data Fields</div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.metric("Files Uploaded", f"{stats['total_files']}")
     
     st.markdown("---")
     
     # Visualizations
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Distributions", "📈 Data Quality", "📁 File Analysis", "📋 Detailed Stats"])
+    tab1, tab2 = st.tabs(["📊 Distributions", "📈 Data Overview"])
     
     with tab1:
         col_a, col_b = st.columns(2)
@@ -669,94 +648,49 @@ def analytics_dashboard_page(warehouse: PrivacyCompliantDataWarehouse):
             if 'source_distribution' in stats and stats['source_distribution']:
                 source_df = pd.DataFrame(list(stats['source_distribution'].items()), 
                                         columns=['Source', 'Count'])
-                fig = px.pie(source_df, values='Count', names='Source', 
-                            title='Records by Source', hole=0.3)
+                fig = px.pie(source_df, values='Count', names='Source', title='Records by Source', hole=0.3)
                 st.plotly_chart(fig, use_container_width=True)
         
         with col_b:
             if 'category_distribution' in stats and stats['category_distribution']:
                 cat_df = pd.DataFrame(list(stats['category_distribution'].items()),
                                      columns=['Category', 'Count'])
-                fig = px.bar(cat_df, x='Category', y='Count', 
-                           title='Records by Category', color='Count')
+                fig = px.bar(cat_df, x='Category', y='Count', title='Records by Category', color='Count')
                 st.plotly_chart(fig, use_container_width=True)
     
     with tab2:
-        col_a, col_b = st.columns(2)
-        
-        with col_a:
-            if 'quality_distribution' in stats:
-                quality_df = pd.DataFrame(list(stats['quality_distribution'].items()),
-                                         columns=['Quality Level', 'Count'])
-                fig = px.bar(quality_df, x='Quality Level', y='Count',
-                           title='Data Quality Distribution', color='Quality Level')
-                st.plotly_chart(fig, use_container_width=True)
-        
-        with col_b:
-            if 'column_completeness' in stats and stats['column_completeness']:
-                completeness_df = pd.DataFrame(list(stats['column_completeness'].items()),
-                                              columns=['Column', 'Completeness %'])
-                completeness_df = completeness_df.sort_values('Completeness %', ascending=True).tail(10)
-                fig = px.bar(completeness_df, x='Completeness %', y='Column',
-                           orientation='h', title='Top 10 Columns by Completeness')
-                st.plotly_chart(fig, use_container_width=True)
-    
-    with tab3:
-        if st.session_state.file_metadata:
-            files_df = pd.DataFrame(st.session_state.file_metadata)
-            
-            col_a, col_b = st.columns(2)
-            
-            with col_a:
-                # Upload timeline
-                files_df['upload_date'] = pd.to_datetime(files_df['upload_date'])
-                timeline = files_df.groupby(files_df['upload_date'].dt.date).size().reset_index()
-                timeline.columns = ['Date', 'Files']
-                fig = px.line(timeline, x='Date', y='Files', 
-                            title='File Upload Timeline', markers=True)
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col_b:
-                # Records per file
-                fig = px.bar(files_df, x='file_name', y='records_added',
-                           title='Records Added per File', color='records_added')
-                fig.update_layout(xaxis_tickangle=-45, height=400)
-                st.plotly_chart(fig, use_container_width=True)
-    
-    with tab4:
-        st.subheader("Detailed Statistics")
-        
-        # Source breakdown
-        if 'source_distribution' in stats and stats['source_distribution']:
-            st.write("**Source Distribution**")
-            source_df = pd.DataFrame(list(stats['source_distribution'].items()), 
-                                    columns=['Source', 'Record Count'])
-            source_df = source_df.sort_values('Record Count', ascending=False)
-            st.dataframe(source_df, use_container_width=True)
-        
-        # File metadata
-        if st.session_state.file_metadata:
-            st.write("**File Upload History**")
-            files_df = pd.DataFrame(st.session_state.file_metadata)
-            st.dataframe(files_df, use_container_width=True)
+        # Top cities
+        if 'city' in df.columns:
+            city_counts = df['city'].value_counts().head(10)
+            fig = px.bar(x=city_counts.values, y=city_counts.index, orientation='h',
+                        title='Top 10 Cities', labels={'x': 'Count', 'y': 'City'})
+            st.plotly_chart(fig, use_container_width=True)
 
-def data_management_page(warehouse: PrivacyCompliantDataWarehouse):
-    """Data management interface"""
-    st.header("📁 Data Management")
+def ai_mapping_page(warehouse: AIWarehouse):
+    """Show AI column mappings"""
+    st.header("🤖 AI Column Mapping History")
+    
+    if not st.session_state.column_mappings:
+        st.info("No files processed yet. Upload files to see AI column mappings.")
+        return
+    
+    st.subheader("How AI Mapped Your Files")
+    
+    for file_name, mapping in st.session_state.column_mappings.items():
+        with st.expander(f"📄 {file_name}"):
+            st.json(mapping)
+            
+            # Show AI explanation
+            st.markdown("**🤖 AI Analysis:**")
+            st.caption("AI automatically detected and mapped columns based on column names and data patterns")
+
+def file_management_page(warehouse: AIWarehouse):
+    """File management"""
+    st.header("📁 File Management")
     
     if st.session_state.data_warehouse.empty:
         st.info("No data to manage")
         return
-    
-    st.subheader("Current Data Overview")
-    
-    # Data preview
-    with st.expander("📊 Data Preview (First 100 rows)"):
-        preview_cols = [col for col in st.session_state.data_warehouse.columns if not col.startswith('_')][:10]
-        st.dataframe(st.session_state.data_warehouse[preview_cols].head(100), use_container_width=True)
-    
-    st.markdown("---")
-    st.subheader("Data Management Actions")
     
     col1, col2 = st.columns(2)
     
@@ -764,94 +698,52 @@ def data_management_page(warehouse: PrivacyCompliantDataWarehouse):
         if st.button("🗑️ Clear All Data", type="secondary", use_container_width=True):
             st.session_state.data_warehouse = pd.DataFrame()
             st.session_state.file_metadata = []
-            st.session_state.query_history = []
-            st.session_state.available_columns = set()
-            st.session_state.primary_key_column = None
-            st.success("All data cleared successfully!")
+            st.session_state.column_mappings = {}
+            st.success("All data cleared!")
             st.rerun()
     
     with col2:
-        # Export all data
         if st.button("📥 Export All Data", type="primary", use_container_width=True):
             export_df = st.session_state.data_warehouse.copy()
-            # Remove internal columns
-            export_df = export_df[[col for col in export_df.columns if not col.startswith('_')]]
-            
             csv = export_df.to_csv(index=False).encode()
-            st.download_button(
-                "Download CSV",
-                csv,
-                f"full_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "text/csv"
-            )
+            st.download_button("Download CSV", csv, f"full_export_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
     
-    # File management
+    # Show file list
     if st.session_state.file_metadata:
         st.markdown("---")
         st.subheader("Uploaded Files")
         files_df = pd.DataFrame(st.session_state.file_metadata)
         st.dataframe(files_df, use_container_width=True)
 
-def system_info_page(warehouse: PrivacyCompliantDataWarehouse):
+def system_info_page(warehouse: AIWarehouse):
     """System information"""
     st.header("ℹ️ System Information")
     
     st.markdown("""
-    ### About This Application
+    ### 🤖 AI-Powered Real Estate Data Warehouse
     
-    **Pan-India Real Estate Data Warehouse** is a powerful data management system designed to:
+    **Features:**
+    - **AI Column Detection**: Uses Claude AI to automatically map columns from any file structure
+    - **Smart Error Handling**: Automatically fixes Excel format issues and missing columns
+    - **Contact Number Standardization**: Automatically standardizes contact numbers to 10 digits
+    - **Intelligent Deduplication**: Uses contact numbers as primary key
+    - **Dynamic Querying**: Search across all data with multiple filters
     
-    - **Upload and correlate data** from multiple Excel/CSV files
-    - **Use any column as primary key** (mobile, email, ID, etc.) for data correlation
-    - **Dynamic querying** across all uploaded data
-    - **Privacy-first approach** - works with column structures, not specific values
-    - **Real-time analytics** and visualizations
-    - **Flexible export** capabilities
+    ### How AI Helps
     
-    ### Key Features
+    1. **Column Mapping**: AI analyzes column names and sample data to identify contact numbers, names, emails, addresses, etc.
+    2. **Format Detection**: Automatically handles different Excel formats (.xls, .xlsx)
+    3. **Data Cleaning**: Standardizes phone numbers and handles missing values
     
-    1. **Multi-File Upload**: Process hundreds of files simultaneously
-    2. **Smart Column Detection**: Automatically identifies key columns
-    3. **Flexible Primary Key**: Use any unique identifier column
-    4. **Dynamic Query Builder**: Build custom queries with multiple filters
-    5. **Comprehensive Analytics**: Visualize data from multiple perspectives
-    6. **Data Quality Scoring**: Automatic quality assessment
+    ### Supported File Formats
+    - Excel (.xlsx, .xls) with automatic engine detection
+    - CSV files
     
-    ### How It Works
-    
-    - Upload files → System detects best primary key column
-    - Data is correlated using the primary key
-    - Query across all files using any field
-    - Export results in multiple formats
-    
-    ### Privacy & Security
-    
-    - No data is persisted outside the session
-    - All processing happens in-memory
-    - No external API calls or data sharing
-    - Column-based correlation (not value-based)
-    
-    ### Technical Details
-    
-    - Built with Streamlit
-    - Uses Pandas for data processing
-    - Plotly for visualizations
-    - Supports Excel, CSV formats
+    ### Privacy Note
+    - No data is stored permanently
+    - AI processing uses only column structures, not actual data values
+    - API keys are not stored
     """)
-    
-    # Current system status
-    st.markdown("---")
-    st.subheader("Current System Status")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.json({
-            "Total Records": len(st.session_state.data_warehouse),
-            "Total Files": len(st.session_state.file_metadata),
-            "Primary Key Column": st.session_state.primary_key_column or "Not set",
-            "Available Columns": len(st.session_state.available_columns),
-            "Query History": len(st.session_state.query_history)
-        })
 
 if __name__ == "__main__":
     main()
