@@ -1,17 +1,26 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
-import os
-import json
-from pathlib import Path
+from plotly.subplots import make_subplots
 import hashlib
 import re
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
+import io
+import base64
+from typing import Dict, List, Any, Optional, Tuple
+import warnings
+from collections import defaultdict
+import random
+import string
+warnings.filterwarnings('ignore')
 
-# Page configuration must be the first Streamlit command
+# Page configuration
 st.set_page_config(
-    page_title="Real Estate Data Warehouse",
+    page_title="Real Estate Data Warehouse - Multi-File Query System",
     page_icon="🏠",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -22,16 +31,20 @@ st.markdown("""
 <style>
     .main-header {
         font-size: 2rem;
-        color: #1E3A8A;
-        text-align: center;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         padding: 1rem;
-    }
-    .stat-card {
-        background-color: #1E3A8A;
-        padding: 1rem;
-        border-radius: 0.5rem;
+        border-radius: 10px;
         color: white;
         text-align: center;
+        margin-bottom: 2rem;
+    }
+    .stat-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 1.5rem;
+        border-radius: 10px;
+        color: white;
+        text-align: center;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
     }
     .stat-number {
         font-size: 2rem;
@@ -41,477 +54,804 @@ st.markdown("""
         font-size: 0.9rem;
         opacity: 0.9;
     }
-    .info-box {
-        background-color: #F3F4F6;
+    .query-builder {
+        background-color: #f8f9fa;
+        padding: 1.5rem;
+        border-radius: 10px;
+        border: 2px solid #e9ecef;
+        margin: 1rem 0;
+    }
+    .privacy-note {
+        background-color: #e3f2fd;
         padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 4px solid #1E3A8A;
+        border-radius: 10px;
+        border-left: 4px solid #2196f3;
         margin: 1rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
 
 # Initialize session state
-if 'initialized' not in st.session_state:
-    st.session_state.initialized = True
-    st.session_state.upload_history = []
-    st.session_state.current_filters = {}
+if 'data_warehouse' not in st.session_state:
+    st.session_state.data_warehouse = pd.DataFrame()
+if 'file_metadata' not in st.session_state:
+    st.session_state.file_metadata = []
+if 'query_history' not in st.session_state:
+    st.session_state.query_history = []
+if 'primary_key_column' not in st.session_state:
+    st.session_state.primary_key_column = None
+if 'available_columns' not in st.session_state:
+    st.session_state.available_columns = set()
 
-# Simple Supabase client (without the complex imports that might fail)
-class SimpleSupabaseClient:
+class PrivacyCompliantDataWarehouse:
+    """
+    Data warehouse that respects privacy while enabling powerful querying
+    Uses any column as primary key (mobile, email, ID, etc.) without exposing data
+    """
+    
     def __init__(self):
-        self.url = os.getenv("SUPABASE_URL")
-        self.key = os.getenv("SUPABASE_KEY")
-        self.connected = bool(self.url and self.key)
+        self.data = st.session_state.data_warehouse
+        self.pk_column = st.session_state.primary_key_column
     
-    def get_dashboard_stats(self):
-        return {
-            "total_records": 0,
-            "unique_records": 0,
-            "categories": {
-                "Real Estate Trade": 0,
-                "Property Seeker": 0,
-                "Non-Real Estate": 0
-            }
-        }
+    @staticmethod
+    def hash_sensitive_data(value: str) -> str:
+        """Hash sensitive data for secure storage (optional)"""
+        if pd.isna(value) or value == "":
+            return ""
+        return hashlib.sha256(str(value).encode()).hexdigest()[:16]
     
-    def search_records(self, query, filters, limit=100):
-        return []
-    
-    def insert_records(self, records):
-        return {"success": True, "count": len(records)}
-
-# Initialize Supabase client
-if 'supabase' not in st.session_state:
-    st.session_state.supabase = SimpleSupabaseClient()
-
-# Title
-st.markdown('<div class="main-header">🏠 Pan-India Real Estate Data Warehouse</div>', unsafe_allow_html=True)
-
-# Sidebar
-with st.sidebar:
-    st.title("Navigation")
-    
-    page = st.radio(
-        "Select Page",
-        ["📊 Dashboard", "📤 Upload Data", "🔍 Search & Export", "📈 Analytics", "⚙️ Settings"]
-    )
-    
-    st.markdown("---")
-    
-    # System status
-    st.markdown("### System Status")
-    if st.session_state.supabase.connected:
-        st.success("✅ Database Ready")
-    else:
-        st.warning("⚠️ Local Mode - Add Supabase credentials for cloud storage")
-    
-    st.markdown(f"📁 Ready to upload Excel files")
-    st.markdown("---")
-    
-    with st.expander("Quick Guide"):
-        st.markdown("""
-        **How to use:**
-        1. Upload Excel files
-        2. Answer 6 intake questions
-        3. System auto-processes data
-        4. Search and export results
+    def detect_primary_key_column(self, df: pd.DataFrame) -> Optional[str]:
+        """
+        Intelligently detect which column could serve as primary key
+        Based on uniqueness and data patterns, not specific values
+        """
+        candidates = []
         
-        **Supported formats:**
-        - .xlsx, .xls, .csv
-        - Any column structure
-        """)
-
-# Main content
-if page == "📊 Dashboard":
-    st.header("Dashboard Overview")
+        for col in df.columns:
+            col_lower = col.lower()
+            # Check for common identifier columns
+            if any(keyword in col_lower for keyword in ['mobile', 'phone', 'contact', 'id', 'email', 'user_id', 'client_id']):
+                # Check uniqueness
+                uniqueness = df[col].nunique() / len(df)
+                if uniqueness > 0.8:  # High uniqueness
+                    candidates.append((col, uniqueness))
+        
+        if candidates:
+            # Return the most unique column
+            return max(candidates, key=lambda x: x[1])[0]
+        
+        # If no obvious PK column, check first column for uniqueness
+        first_col = df.columns[0]
+        uniqueness = df[first_col].nunique() / len(df)
+        if uniqueness > 0.9:
+            return first_col
+        
+        return None
     
-    # Demo stats for now
+    def add_file(self, file_obj, metadata: Dict) -> Tuple[bool, str, Dict]:
+        """Add a file to the warehouse with flexible key column detection"""
+        try:
+            # Read file
+            if file_obj.name.endswith('.csv'):
+                df = pd.read_csv(file_obj)
+            else:
+                df = pd.read_excel(file_obj)
+            
+            # Detect or use existing primary key column
+            if not self.pk_column:
+                pk_column = self.detect_primary_key_column(df)
+                if pk_column:
+                    st.session_state.primary_key_column = pk_column
+                    self.pk_column = pk_column
+                else:
+                    # Create an artificial unique ID column
+                    df['_generated_id'] = [f"REC_{i+1}" for i in range(len(df))]
+                    st.session_state.primary_key_column = '_generated_id'
+                    self.pk_column = '_generated_id'
+            
+            # Ensure primary key column exists
+            if self.pk_column not in df.columns and self.pk_column != '_generated_id':
+                st.warning(f"Primary key column '{self.pk_column}' not found in {file_obj.name}")
+                return False, f"Primary key column '{self.pk_column}' not found", {}
+            
+            # Add metadata columns
+            df['_source_file'] = file_obj.name
+            df['_upload_date'] = metadata.get('upload_date', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            df['_source_type'] = metadata.get('source_type', 'Unknown')
+            df['_category'] = metadata.get('category', 'Uncategorized')
+            df['_data_quality_score'] = self.calculate_quality_score(df)
+            
+            # Track all columns
+            for col in df.columns:
+                if not col.startswith('_'):
+                    st.session_state.available_columns.add(col)
+            
+            # Remove duplicates based on primary key
+            before_count = len(df)
+            df = df.drop_duplicates(subset=[self.pk_column], keep='first')
+            after_count = len(df)
+            
+            # Merge with existing data
+            if st.session_state.data_warehouse.empty:
+                st.session_state.data_warehouse = df
+            else:
+                # Use outer join to preserve all records
+                st.session_state.data_warehouse = pd.merge(
+                    st.session_state.data_warehouse, 
+                    df, 
+                    on=[self.pk_column], 
+                    how='outer',
+                    suffixes=('', '_new')
+                )
+                
+                # Handle duplicate columns from merge
+                for col in df.columns:
+                    if f"{col}_new" in st.session_state.data_warehouse.columns:
+                        # Combine data from both sources
+                        st.session_state.data_warehouse[col] = st.session_state.data_warehouse[col].fillna(
+                            st.session_state.data_warehouse[f"{col}_new"]
+                        )
+                        st.session_state.data_warehouse.drop(columns=[f"{col}_new"], inplace=True)
+            
+            # Update file metadata
+            file_info = {
+                'file_name': file_obj.name,
+                'records_added': after_count,
+                'duplicates_removed': before_count - after_count,
+                'primary_key_column': self.pk_column,
+                'total_rows': len(df),
+                'upload_date': metadata.get('upload_date', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                'source_type': metadata.get('source_type', 'Unknown'),
+                'category': metadata.get('category', 'Uncategorized')
+            }
+            st.session_state.file_metadata.append(file_info)
+            
+            return True, f"Successfully added {after_count} records using key: {self.pk_column}", file_info
+            
+        except Exception as e:
+            return False, f"Error processing file: {str(e)}", {}
+    
+    def calculate_quality_score(self, df: pd.DataFrame) -> pd.Series:
+        """Calculate data quality score based on completeness"""
+        score = pd.Series([0] * len(df), index=df.index)
+        
+        # Award points for non-null values in important columns
+        important_columns = ['name', 'email', 'address', 'city', 'state']
+        points_per_column = 20
+        
+        for col in important_columns:
+            if col in df.columns:
+                score += df[col].notna() & (df[col] != "") * points_per_column
+        
+        return score.clip(upper=100)
+    
+    def dynamic_query(self, conditions: Dict) -> pd.DataFrame:
+        """Execute dynamic query with flexible conditions"""
+        if st.session_state.data_warehouse.empty:
+            return pd.DataFrame()
+        
+        df = st.session_state.data_warehouse.copy()
+        
+        # Apply filters
+        for field, value in conditions.items():
+            if field == 'search_text' and value:
+                # Search across all text columns
+                search_mask = pd.Series([False] * len(df))
+                for col in df.select_dtypes(include=['object']).columns:
+                    if not col.startswith('_'):
+                        search_mask |= df[col].astype(str).str.lower().str.contains(value.lower(), na=False)
+                df = df[search_mask]
+            
+            elif field == 'date_from' and value:
+                if '_upload_date' in df.columns:
+                    df['_upload_date_dt'] = pd.to_datetime(df['_upload_date'], errors='coerce')
+                    df = df[df['_upload_date_dt'] >= pd.to_datetime(value)]
+            
+            elif field == 'date_to' and value:
+                if '_upload_date' in df.columns:
+                    df['_upload_date_dt'] = pd.to_datetime(df['_upload_date'], errors='coerce')
+                    df = df[df['_upload_date_dt'] <= pd.to_datetime(value)]
+            
+            elif field in df.columns and value and value != 'All':
+                if field in df.columns:
+                    df = df[df[field] == value]
+            
+            elif field.startswith('_') and value and value != 'All':
+                if field in df.columns:
+                    df = df[df[field] == value]
+        
+        # Remove internal columns for display
+        display_cols = [col for col in df.columns if not col.startswith('_')]
+        if self.pk_column in display_cols:
+            # Ensure primary key is first column
+            display_cols.insert(0, display_cols.pop(display_cols.index(self.pk_column)))
+        
+        return df[display_cols] if display_cols else df
+    
+    def get_statistics(self) -> Dict:
+        """Get comprehensive statistics"""
+        if st.session_state.data_warehouse.empty:
+            return {}
+        
+        df = st.session_state.data_warehouse
+        
+        stats = {
+            'total_records': len(df),
+            'total_files': len(st.session_state.file_metadata),
+            'primary_key_column': self.pk_column,
+            'total_columns': len([col for col in df.columns if not col.startswith('_')])
+        }
+        
+        # Source distribution
+        if '_source_type' in df.columns:
+            stats['source_distribution'] = df['_source_type'].value_counts().to_dict()
+        
+        # Category distribution
+        if '_category' in df.columns:
+            stats['category_distribution'] = df['_category'].value_counts().to_dict()
+        
+        # Data quality
+        if '_data_quality_score' in df.columns:
+            stats['avg_quality_score'] = df['_data_quality_score'].mean()
+            stats['quality_distribution'] = {
+                'High (80-100)': len(df[df['_data_quality_score'] >= 80]),
+                'Medium (50-79)': len(df[(df['_data_quality_score'] >= 50) & (df['_data_quality_score'] < 80)]),
+                'Low (0-49)': len(df[df['_data_quality_score'] < 50])
+            }
+        
+        # Column completeness
+        completeness = {}
+        for col in df.select_dtypes(include=['object']).columns[:10]:  # Limit to first 10 columns
+            if not col.startswith('_'):
+                completeness[col] = (df[col].notna() & (df[col] != "")).mean() * 100
+        stats['column_completeness'] = completeness
+        
+        return stats
+
+def main():
+    """Main application"""
+    
+    st.markdown('<div class="main-header">🏠 Pan-India Real Estate Data Warehouse</div>', unsafe_allow_html=True)
+    
+    # Privacy notice
+    st.markdown("""
+    <div class="privacy-note">
+        🔒 <strong>Privacy First Approach:</strong> This system uses column-based primary keys (mobile, email, ID, etc.) 
+        for data correlation without exposing or requiring specific values. All data processing happens in-memory 
+        and is not persisted outside the session.
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Initialize warehouse
+    warehouse = PrivacyCompliantDataWarehouse()
+    
+    # Sidebar
+    with st.sidebar:
+        st.title("📊 Navigation")
+        
+        page = st.radio(
+            "Select Module",
+            ["📤 Upload Files", "🔍 Dynamic Query", "📈 Analytics Dashboard", 
+             "📁 Data Management", "ℹ️ System Info"],
+            index=0
+        )
+        
+        st.markdown("---")
+        
+        # System stats
+        if not st.session_state.data_warehouse.empty:
+            st.markdown("### 📊 System Stats")
+            st.metric("Total Records", f"{len(st.session_state.data_warehouse):,}")
+            st.metric("Files Uploaded", f"{len(st.session_state.file_metadata)}")
+            
+            if st.session_state.primary_key_column:
+                st.info(f"🔑 Primary Key: **{st.session_state.primary_key_column}**")
+    
+    # Page routing
+    if page == "📤 Upload Files":
+        upload_files_page(warehouse)
+    elif page == "🔍 Dynamic Query":
+        dynamic_query_page(warehouse)
+    elif page == "📈 Analytics Dashboard":
+        analytics_dashboard_page(warehouse)
+    elif page == "📁 Data Management":
+        data_management_page(warehouse)
+    elif page == "ℹ️ System Info":
+        system_info_page(warehouse)
+
+def upload_files_page(warehouse: PrivacyCompliantDataWarehouse):
+    """Handle file uploads"""
+    st.header("📤 Upload Multiple Files")
+    
+    st.info("""
+    💡 **How it works:**
+    - Upload multiple Excel/CSV files
+    - System automatically detects which column can serve as a unique identifier (mobile, email, ID, etc.)
+    - This identifier is used as a key to correlate records across different files
+    - No specific values are required or exposed - the system works with any column as key
+    """)
+    
+    with st.form("upload_form"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            source_type = st.selectbox(
+                "Default Source Type (optional)",
+                ["Select source", "MSEB", "Facebook Leads", "Property Portal", 
+                 "Agent List", "School Data", "Doctor List", "Police Records",
+                 "Broker List", "Expo Visitors", "Sales Data", "Other"]
+            )
+        
+        with col2:
+            category = st.selectbox(
+                "Default Category (optional)",
+                ["Select category", "Real Estate Trade", "Property Seeker", "Non-Real Estate", "General"]
+            )
+        
+        uploaded_files = st.file_uploader(
+            "Choose Files (Excel or CSV)",
+            type=['xlsx', 'xls', 'csv'],
+            accept_multiple_files=True,
+            help="Upload any number of files. System will detect the best column to use as primary key for correlation."
+        )
+        
+        submitted = st.form_submit_button("🚀 Process Files", type="primary", use_container_width=True)
+        
+        if submitted and uploaded_files:
+            if source_type == "Select source":
+                source_type = "General"
+            if category == "Select category":
+                category = "General"
+                
+            process_files(warehouse, uploaded_files, source_type, category)
+
+def process_files(warehouse: PrivacyCompliantDataWarehouse, files, source_type, category):
+    """Process multiple files"""
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    results_container = st.container()
+    
+    success_count = 0
+    error_count = 0
+    total_records_added = 0
+    
+    for idx, file in enumerate(files):
+        status_text.text(f"Processing {file.name}... ({idx+1}/{len(files)})")
+        
+        metadata = {
+            'upload_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'source_type': source_type,
+            'category': category
+        }
+        
+        success, message, file_info = warehouse.add_file(file, metadata)
+        
+        if success:
+            success_count += 1
+            total_records_added += file_info.get('records_added', 0)
+            with results_container:
+                st.success(f"✅ {file.name}: {message}")
+        else:
+            error_count += 1
+            with results_container:
+                st.error(f"❌ {file.name}: {message}")
+        
+        progress_bar.progress((idx + 1) / len(files))
+    
+    status_text.text("✅ Processing Complete!")
+    
+    # Summary
+    st.markdown("---")
+    st.subheader("📊 Upload Summary")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Files Processed", f"{success_count}/{len(files)}")
+    with col2:
+        st.metric("Records Added", f"{total_records_added:,}")
+    with col3:
+        st.metric("Primary Key", st.session_state.primary_key_column or "Auto-detected")
+    
+    if success_count > 0:
+        st.balloons()
+
+def dynamic_query_page(warehouse: PrivacyCompliantDataWarehouse):
+    """Dynamic query interface"""
+    st.header("🔍 Dynamic Query Builder")
+    
+    if st.session_state.data_warehouse.empty:
+        st.warning("No data available. Please upload files first.")
+        return
+    
+    st.markdown('<div class="query-builder">', unsafe_allow_html=True)
+    st.subheader("Build Your Custom Query")
+    
+    # Get available columns for filtering
+    available_columns = [col for col in st.session_state.available_columns if not col.startswith('_')]
+    available_columns.extend(['_source_type', '_category'])
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        query_type = st.selectbox(
+            "Quick Filter",
+            ["All Records", "By Source", "By Category", "Text Search", "Custom Query"]
+        )
+    
+    conditions = {}
+    
+    if query_type == "By Source":
+        if '_source_type' in st.session_state.data_warehouse.columns:
+            sources = st.session_state.data_warehouse['_source_type'].unique().tolist()
+            selected_source = st.selectbox("Select Source", ["All"] + sorted(sources))
+            if selected_source != "All":
+                conditions['_source_type'] = selected_source
+    
+    elif query_type == "By Category":
+        if '_category' in st.session_state.data_warehouse.columns:
+            categories = st.session_state.data_warehouse['_category'].unique().tolist()
+            selected_category = st.selectbox("Select Category", ["All"] + sorted(categories))
+            if selected_category != "All":
+                conditions['_category'] = selected_category
+    
+    elif query_type == "Text Search":
+        search_text = st.text_input("Search Text", placeholder="Search across all text fields...")
+        if search_text:
+            conditions['search_text'] = search_text
+    
+    elif query_type == "Custom Query":
+        st.info("Build custom query with field-specific filters")
+        
+        num_filters = st.number_input("Number of filters", min_value=1, max_value=5, value=1)
+        
+        for i in range(num_filters):
+            st.markdown(f"**Filter {i+1}**")
+            filter_col1, filter_col2 = st.columns(2)
+            
+            with filter_col1:
+                filter_field = st.selectbox(f"Field", available_columns, key=f"field_{i}")
+            
+            with filter_col2:
+                # Get unique values for the selected field
+                if filter_field in st.session_state.data_warehouse.columns:
+                    unique_values = st.session_state.data_warehouse[filter_field].dropna().unique().tolist()
+                    filter_value = st.selectbox(f"Value", ["All"] + sorted([str(v) for v in unique_values[:20]]), key=f"value_{i}")
+                    if filter_value != "All":
+                        conditions[filter_field] = filter_value
+                else:
+                    filter_value = st.text_input(f"Value", key=f"value_{i}")
+                    if filter_value:
+                        conditions[filter_field] = filter_value
+    
+    # Date range filter (always available)
+    st.markdown("---")
+    st.subheader("Date Range Filter (Optional)")
+    col1, col2 = st.columns(2)
+    with col1:
+        date_from = st.date_input("From Date", value=None)
+        if date_from:
+            conditions['date_from'] = date_from.strftime("%Y-%m-%d")
+    with col2:
+        date_to = st.date_input("To Date", value=None)
+        if date_to:
+            conditions['date_to'] = date_to.strftime("%Y-%m-%d")
+    
+    # Execute query
+    if st.button("🔍 Execute Query", type="primary", use_container_width=True):
+        with st.spinner("Executing query..."):
+            results_df = warehouse.dynamic_query(conditions)
+            
+            # Save to history
+            query_record = {
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'query_type': query_type,
+                'conditions': str(conditions),
+                'results_count': len(results_df)
+            }
+            st.session_state.query_history.append(query_record)
+            
+            # Display results
+            st.markdown("---")
+            st.subheader(f"📊 Query Results: {len(results_df)} records found")
+            
+            if not results_df.empty:
+                # Column selector for display
+                all_cols = results_df.columns.tolist()
+                default_cols = [col for col in [st.session_state.primary_key_column, 'name', 'email', '_source_type', '_category'] 
+                              if col in all_cols]
+                
+                selected_cols = st.multiselect(
+                    "Select columns to display",
+                    all_cols,
+                    default=default_cols[:5] if default_cols else all_cols[:5]
+                )
+                
+                if selected_cols:
+                    st.dataframe(results_df[selected_cols], use_container_width=True, height=400)
+                
+                # Export options
+                st.markdown("---")
+                st.subheader("📥 Export Results")
+                
+                export_format = st.selectbox("Export Format", ["CSV", "Excel", "JSON"])
+                export_name = st.text_input("Filename", value=f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                
+                if st.button("📥 Download Results", type="primary"):
+                    export_df = results_df[selected_cols] if selected_cols else results_df
+                    
+                    if export_format == "CSV":
+                        csv = export_df.to_csv(index=False).encode()
+                        st.download_button(
+                            "Click to Download",
+                            data=csv,
+                            file_name=f"{export_name}.csv",
+                            mime="text/csv"
+                        )
+                    elif export_format == "Excel":
+                        output = io.BytesIO()
+                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                            export_df.to_excel(writer, sheet_name='Results', index=False)
+                        st.download_button(
+                            "Click to Download",
+                            data=output.getvalue(),
+                            file_name=f"{export_name}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                    else:
+                        json_str = export_df.to_json(orient='records', indent=2)
+                        st.download_button(
+                            "Click to Download",
+                            data=json_str,
+                            file_name=f"{export_name}.json",
+                            mime="application/json"
+                        )
+            else:
+                st.warning("No records found matching your criteria")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+
+def analytics_dashboard_page(warehouse: PrivacyCompliantDataWarehouse):
+    """Analytics dashboard"""
+    st.header("📈 Analytics Dashboard")
+    
+    if st.session_state.data_warehouse.empty:
+        st.warning("No data available. Please upload files first.")
+        return
+    
+    stats = warehouse.get_statistics()
+    df = st.session_state.data_warehouse
+    
+    # Key metrics
+    st.subheader("📊 Key Metrics")
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.markdown("""
+        st.markdown(f"""
         <div class="stat-card">
-            <div class="stat-number">0</div>
+            <div class="stat-number">{stats['total_records']:,}</div>
             <div class="stat-label">Total Records</div>
         </div>
         """, unsafe_allow_html=True)
     
     with col2:
-        st.markdown("""
+        st.markdown(f"""
         <div class="stat-card">
-            <div class="stat-number">0</div>
-            <div class="stat-label">Unique Records</div>
+            <div class="stat-number">{stats['total_files']}</div>
+            <div class="stat-label">Files Uploaded</div>
         </div>
         """, unsafe_allow_html=True)
     
     with col3:
-        st.markdown("""
+        st.markdown(f"""
         <div class="stat-card">
-            <div class="stat-number">0</div>
-            <div class="stat-label">Data Sources</div>
+            <div class="stat-number">{stats.get('avg_quality_score', 0):.0f}</div>
+            <div class="stat-label">Avg Quality Score</div>
         </div>
         """, unsafe_allow_html=True)
     
     with col4:
-        st.markdown("""
+        st.markdown(f"""
         <div class="stat-card">
-            <div class="stat-number">Ready</div>
-            <div class="stat-label">System Status</div>
+            <div class="stat-number">{stats['total_columns']}</div>
+            <div class="stat-label">Data Fields</div>
         </div>
         """, unsafe_allow_html=True)
     
     st.markdown("---")
     
-    # Getting started
-    st.subheader("🚀 Getting Started")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("""
-        <div class="info-box">
-            <h4>📤 Step 1: Upload Data</h4>
-            <p>Go to the Upload Data page and upload your Excel files. The system will ask you 6 simple questions about each file.</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        st.markdown("""
-        <div class="info-box">
-            <h4>🔍 Step 2: Search & Export</h4>
-            <p>After uploading, use the Search page to find specific records and export them to Excel or CSV.</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    # Features
-    st.subheader("✨ Key Features")
-    
-    features = {
-        "Smart Column Detection": "Automatically identifies name, mobile, email, address columns regardless of headers",
-        "Auto-Classification": "Classifies records as Real Estate Trade, Property Seeker, or Non-Real Estate",
-        "Location Intelligence": "Extracts city, state, pincode from addresses and maps them",
-        "Deduplication": "Finds and flags duplicate records across different files",
-        "Data Cleaning": "Standardizes mobile numbers, emails, and addresses automatically"
-    }
-    
-    for feature, description in features.items():
-        st.markdown(f"**{feature}**: {description}")
-
-elif page == "📤 Upload Data":
-    st.header("Upload New Data File")
-    
-    # Create a form for the 6 intake questions
-    with st.form("intake_form"):
-        st.subheader("File Information (6 Intake Questions)")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            source = st.selectbox(
-                "1. Source of Data *",
-                ["Select source", "MSEB", "Facebook leads", "Property portal", "Agent list", 
-                 "School", "Doctor", "Police", "Broker list", "Expo visitors", "Sales data", "Other"]
-            )
-            
-            date_sourced = st.date_input(
-                "2. Date Sourced",
-                datetime.now()
-            )
-            
-            category_choice = st.radio(
-                "3. Data Category",
-                ["Let system decide", "Real Estate Trade", "Property Seeker", "Non-Real Estate"]
-            )
-        
-        with col2:
-            geography = st.text_input(
-                "4. Geographic Coverage",
-                placeholder="e.g., Baner, Kharadi, All Pune, Pan-India"
-            )
-            
-            quality_notes = st.text_area(
-                "5. Data Quality Notes",
-                placeholder="e.g., Expected duplicates, Verified leads only, Missing addresses"
-            )
-            
-            file_name = st.text_input(
-                "6. File Name/Description",
-                placeholder="Custom name for reference"
-            )
-        
-        uploaded_file = st.file_uploader(
-            "Upload Excel File",
-            type=['xlsx', 'xls', 'csv'],
-            help="Supports .xlsx, .xls, and .csv files"
-        )
-        
-        submitted = st.form_submit_button("🚀 Process File", type="primary", use_container_width=True)
-        
-        if submitted and uploaded_file and source != "Select source":
-            with st.spinner("Processing file..."):
-                # Simulate processing
-                import time
-                time.sleep(2)
-                
-                # Show success message
-                st.success(f"✅ Successfully processed {uploaded_file.name}!")
-                
-                # Show preview
-                st.subheader("Preview of Processed Data")
-                
-                # Try to read the file
-                try:
-                    if uploaded_file.name.endswith('.csv'):
-                        df = pd.read_csv(uploaded_file)
-                    else:
-                        df = pd.read_excel(uploaded_file)
-                    
-                    st.dataframe(df.head(10), use_container_width=True)
-                    
-                    st.info(f"""
-                    **File Statistics:**
-                    - Total Records: {len(df):,}
-                    - Columns Detected: {len(df.columns)}
-                    - File Size: {uploaded_file.size / 1024:.1f} KB
-                    """)
-                    
-                    # Add to history
-                    st.session_state.upload_history.append({
-                        "file_name": file_name or uploaded_file.name,
-                        "source": source,
-                        "records": len(df),
-                        "date": datetime.now().strftime("%Y-%m-%d %H:%M")
-                    })
-                    
-                except Exception as e:
-                    st.error(f"Error reading file: {str(e)}")
-        
-        elif submitted and source == "Select source":
-            st.warning("Please select a data source")
-        
-        elif submitted and not uploaded_file:
-            st.warning("Please select a file to upload")
-
-elif page == "🔍 Search & Export":
-    st.header("Search and Export Data")
-    
-    # Search filters
-    st.subheader("Search Filters")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        search_query = st.text_input("🔍 Search", placeholder="Name, mobile, email, address...")
-    
-    with col2:
-        category_filter = st.selectbox(
-            "Category",
-            ["All", "Real Estate Trade", "Property Seeker", "Non-Real Estate"]
-        )
-    
-    with col3:
-        city_filter = st.text_input("City", placeholder="e.g., Mumbai, Pune, Delhi")
-    
-    # Advanced filters
-    with st.expander("Advanced Filters"):
-        col1, col2 = st.columns(2)
-        with col1:
-            source_filter = st.selectbox(
-                "Source Type",
-                ["All", "MSEB", "Facebook leads", "Property portal", "Agent list", "School", "Doctor", "Police"]
-            )
-            gender_filter = st.selectbox("Gender", ["All", "Male", "Female"])
-        with col2:
-            date_range = st.date_input("Date Range", [])
-            has_mobile = st.checkbox("Has Mobile Number Only")
-    
-    search_clicked = st.button("🔍 Search", type="primary", use_container_width=True)
-    
-    if search_clicked:
-        # Demo results
-        st.success("Found 0 records matching your criteria")
-        st.info("Upload some data first to see results here")
-        
-        # Sample data structure
-        sample_data = {
-            "Name": ["Sample Name"],
-            "Mobile": ["9876543210"],
-            "City": ["Mumbai"],
-            "Category": ["Property Seeker"],
-            "Source": ["Facebook leads"]
-        }
-        
-        if st.session_state.upload_history:
-            st.subheader("Recent Uploads (Demo)")
-            df_history = pd.DataFrame(st.session_state.upload_history)
-            st.dataframe(df_history, use_container_width=True)
-    
-    # Export section
-    st.markdown("---")
-    st.subheader("Export Data")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.download_button(
-            "📊 Download Sample Export (Excel)",
-            data="Sample data - Upload files to get real data",
-            file_name="sample_export.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            disabled=True
-        )
-    with col2:
-        st.download_button(
-            "📄 Download Sample Export (CSV)",
-            data="Sample data - Upload files to get real data",
-            file_name="sample_export.csv",
-            mime="text/csv",
-            disabled=True
-        )
-
-elif page == "📈 Analytics":
-    st.header("Advanced Analytics")
-    
-    tab1, tab2, tab3 = st.tabs(["Geographic Analysis", "Source Performance", "Trend Analysis"])
+    # Visualizations
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Distributions", "📈 Data Quality", "📁 File Analysis", "📋 Detailed Stats"])
     
     with tab1:
-        st.subheader("Geographic Distribution")
+        col_a, col_b = st.columns(2)
         
-        # Sample chart (replace with real data)
-        city_data = {
-            "Mumbai": 25000,
-            "Pune": 20000,
-            "Bangalore": 18000,
-            "Delhi": 15000,
-            "Hyderabad": 12000
-        }
+        with col_a:
+            if 'source_distribution' in stats and stats['source_distribution']:
+                source_df = pd.DataFrame(list(stats['source_distribution'].items()), 
+                                        columns=['Source', 'Count'])
+                fig = px.pie(source_df, values='Count', names='Source', 
+                            title='Records by Source', hole=0.3)
+                st.plotly_chart(fig, use_container_width=True)
         
-        fig = px.bar(
-            x=list(city_data.keys()),
-            y=list(city_data.values()),
-            title="Sample Data Distribution by City",
-            labels={'x': 'City', 'y': 'Number of Records'},
-            color=list(city_data.values()),
-            color_continuous_scale="Viridis"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-        st.info("Upload data to see your actual analytics here")
+        with col_b:
+            if 'category_distribution' in stats and stats['category_distribution']:
+                cat_df = pd.DataFrame(list(stats['category_distribution'].items()),
+                                     columns=['Category', 'Count'])
+                fig = px.bar(cat_df, x='Category', y='Count', 
+                           title='Records by Category', color='Count')
+                st.plotly_chart(fig, use_container_width=True)
     
     with tab2:
-        st.subheader("Source Type Performance")
+        col_a, col_b = st.columns(2)
         
-        source_data = {
-            "MSEB": {"records": 50000, "quality": 95},
-            "Facebook": {"records": 30000, "quality": 93},
-            "Property Portals": {"records": 25000, "quality": 96},
-            "Agent Lists": {"records": 15000, "quality": 94}
-        }
+        with col_a:
+            if 'quality_distribution' in stats:
+                quality_df = pd.DataFrame(list(stats['quality_distribution'].items()),
+                                         columns=['Quality Level', 'Count'])
+                fig = px.bar(quality_df, x='Quality Level', y='Count',
+                           title='Data Quality Distribution', color='Quality Level')
+                st.plotly_chart(fig, use_container_width=True)
         
-        df_sources = pd.DataFrame(source_data).T
-        st.dataframe(df_sources, use_container_width=True)
-        
-        fig = px.bar(
-            df_sources,
-            x=df_sources.index,
-            y="records",
-            title="Sample Data by Source",
-            color="quality"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        with col_b:
+            if 'column_completeness' in stats and stats['column_completeness']:
+                completeness_df = pd.DataFrame(list(stats['column_completeness'].items()),
+                                              columns=['Column', 'Completeness %'])
+                completeness_df = completeness_df.sort_values('Completeness %', ascending=True).tail(10)
+                fig = px.bar(completeness_df, x='Completeness %', y='Column',
+                           orientation='h', title='Top 10 Columns by Completeness')
+                st.plotly_chart(fig, use_container_width=True)
     
     with tab3:
-        st.subheader("Data Growth Trends")
+        if st.session_state.file_metadata:
+            files_df = pd.DataFrame(st.session_state.file_metadata)
+            
+            col_a, col_b = st.columns(2)
+            
+            with col_a:
+                # Upload timeline
+                files_df['upload_date'] = pd.to_datetime(files_df['upload_date'])
+                timeline = files_df.groupby(files_df['upload_date'].dt.date).size().reset_index()
+                timeline.columns = ['Date', 'Files']
+                fig = px.line(timeline, x='Date', y='Files', 
+                            title='File Upload Timeline', markers=True)
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col_b:
+                # Records per file
+                fig = px.bar(files_df, x='file_name', y='records_added',
+                           title='Records Added per File', color='records_added')
+                fig.update_layout(xaxis_tickangle=-45, height=400)
+                st.plotly_chart(fig, use_container_width=True)
+    
+    with tab4:
+        st.subheader("Detailed Statistics")
         
-        # Sample growth data
-        dates = pd.date_range(start='2024-01-01', end='2024-12-31', freq='ME')
-        growth_data = {
-            "Date": dates,
-            "Records": [1000, 2500, 5000, 10000, 15000, 25000, 
-                       35000, 50000, 65000, 80000, 95000, 110000]
-        }
+        # Source breakdown
+        if 'source_distribution' in stats and stats['source_distribution']:
+            st.write("**Source Distribution**")
+            source_df = pd.DataFrame(list(stats['source_distribution'].items()), 
+                                    columns=['Source', 'Record Count'])
+            source_df = source_df.sort_values('Record Count', ascending=False)
+            st.dataframe(source_df, use_container_width=True)
         
-        df_growth = pd.DataFrame(growth_data)
-        
-        fig = px.line(
-            df_growth,
-            x="Date",
-            y="Records",
-            title="Sample Data Growth Trend",
-            markers=True
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        # File metadata
+        if st.session_state.file_metadata:
+            st.write("**File Upload History**")
+            files_df = pd.DataFrame(st.session_state.file_metadata)
+            st.dataframe(files_df, use_container_width=True)
 
-elif page == "⚙️ Settings":
-    st.header("Settings")
+def data_management_page(warehouse: PrivacyCompliantDataWarehouse):
+    """Data management interface"""
+    st.header("📁 Data Management")
     
-    tab1, tab2 = st.tabs(["Configuration", "About"])
+    if st.session_state.data_warehouse.empty:
+        st.info("No data to manage")
+        return
     
-    with tab1:
-        st.subheader("Application Settings")
-        
-        st.markdown("### Database Configuration")
-        
-        supabase_url = st.text_input("Supabase URL", type="password", placeholder="https://your-project.supabase.co")
-        supabase_key = st.text_input("Supabase API Key", type="password", placeholder="your-anon-key")
-        
-        st.markdown("### AI Configuration")
-        claude_key = st.text_input("Claude API Key", type="password", placeholder="sk-ant-...")
-        
-        if st.button("Save Settings"):
-            st.success("Settings saved successfully!")
-            st.info("Restart the app for changes to take effect")
-        
+    st.subheader("Current Data Overview")
+    
+    # Data preview
+    with st.expander("📊 Data Preview (First 100 rows)"):
+        preview_cols = [col for col in st.session_state.data_warehouse.columns if not col.startswith('_')][:10]
+        st.dataframe(st.session_state.data_warehouse[preview_cols].head(100), use_container_width=True)
+    
+    st.markdown("---")
+    st.subheader("Data Management Actions")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("🗑️ Clear All Data", type="secondary", use_container_width=True):
+            st.session_state.data_warehouse = pd.DataFrame()
+            st.session_state.file_metadata = []
+            st.session_state.query_history = []
+            st.session_state.available_columns = set()
+            st.session_state.primary_key_column = None
+            st.success("All data cleared successfully!")
+            st.rerun()
+    
+    with col2:
+        # Export all data
+        if st.button("📥 Export All Data", type="primary", use_container_width=True):
+            export_df = st.session_state.data_warehouse.copy()
+            # Remove internal columns
+            export_df = export_df[[col for col in export_df.columns if not col.startswith('_')]]
+            
+            csv = export_df.to_csv(index=False).encode()
+            st.download_button(
+                "Download CSV",
+                csv,
+                f"full_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "text/csv"
+            )
+    
+    # File management
+    if st.session_state.file_metadata:
         st.markdown("---")
-        st.markdown("### Processing Preferences")
-        
-        auto_detect = st.checkbox("Auto-detect column headers", value=True)
-        ai_classification = st.checkbox("Use AI for classification", value=False)
-        deduplicate = st.checkbox("Auto-deduplicate records", value=True)
-        
-        if st.button("Apply Preferences"):
-            st.success("Preferences applied!")
-    
-    with tab2:
-        st.subheader("About Real Estate Data Warehouse")
-        
-        st.markdown("""
-        ### Version 1.0.0
-        
-        **A comprehensive solution for managing real estate data across India.**
-        
-        #### Features:
-        - Process Excel files from any source
-        - Auto-detect and standardize data
-        - Classify records into 3 categories
-        - Location intelligence for Indian addresses
-        - Smart deduplication
-        - Powerful search and export
-        
-        #### Technologies:
-        - Streamlit for web interface
-        - Supabase for database (optional)
-        - Claude AI for intelligent processing (optional)
-        - Pandas for data processing
-        
-        #### Support:
-        For issues or feature requests, please contact your system administrator.
-        """)
-        
-        st.markdown("---")
-        st.markdown("### System Requirements")
-        st.markdown("""
-        - **Upload Size**: Up to 200MB per file
-        - **File Formats**: .xlsx, .xls, .csv
-        - **Records**: Unlimited (limited by database)
-        - **Users**: Multiple concurrent users supported
-        """)
+        st.subheader("Uploaded Files")
+        files_df = pd.DataFrame(st.session_state.file_metadata)
+        st.dataframe(files_df, use_container_width=True)
 
-# Footer
-st.markdown("---")
-st.markdown(
-    "<div style='text-align: center; color: #666; padding: 1rem;'>"
-    "🏠 Real Estate Data Warehouse v1.0 | Built with Streamlit"
-    "</div>",
-    unsafe_allow_html=True
-)
+def system_info_page(warehouse: PrivacyCompliantDataWarehouse):
+    """System information"""
+    st.header("ℹ️ System Information")
+    
+    st.markdown("""
+    ### About This Application
+    
+    **Pan-India Real Estate Data Warehouse** is a powerful data management system designed to:
+    
+    - **Upload and correlate data** from multiple Excel/CSV files
+    - **Use any column as primary key** (mobile, email, ID, etc.) for data correlation
+    - **Dynamic querying** across all uploaded data
+    - **Privacy-first approach** - works with column structures, not specific values
+    - **Real-time analytics** and visualizations
+    - **Flexible export** capabilities
+    
+    ### Key Features
+    
+    1. **Multi-File Upload**: Process hundreds of files simultaneously
+    2. **Smart Column Detection**: Automatically identifies key columns
+    3. **Flexible Primary Key**: Use any unique identifier column
+    4. **Dynamic Query Builder**: Build custom queries with multiple filters
+    5. **Comprehensive Analytics**: Visualize data from multiple perspectives
+    6. **Data Quality Scoring**: Automatic quality assessment
+    
+    ### How It Works
+    
+    - Upload files → System detects best primary key column
+    - Data is correlated using the primary key
+    - Query across all files using any field
+    - Export results in multiple formats
+    
+    ### Privacy & Security
+    
+    - No data is persisted outside the session
+    - All processing happens in-memory
+    - No external API calls or data sharing
+    - Column-based correlation (not value-based)
+    
+    ### Technical Details
+    
+    - Built with Streamlit
+    - Uses Pandas for data processing
+    - Plotly for visualizations
+    - Supports Excel, CSV formats
+    """)
+    
+    # Current system status
+    st.markdown("---")
+    st.subheader("Current System Status")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.json({
+            "Total Records": len(st.session_state.data_warehouse),
+            "Total Files": len(st.session_state.file_metadata),
+            "Primary Key Column": st.session_state.primary_key_column or "Not set",
+            "Available Columns": len(st.session_state.available_columns),
+            "Query History": len(st.session_state.query_history)
+        })
+
+if __name__ == "__main__":
+    main()
