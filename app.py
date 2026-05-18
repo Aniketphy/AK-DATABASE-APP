@@ -1,18 +1,14 @@
 import streamlit as st
 import pandas as pd
-import duckdb
 import sqlite3
 import re
 import json
 import hashlib
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
-from pathlib import Path
 import warnings
-import os
 import io
 import chardet
-import Levenshtein
 
 warnings.filterwarnings('ignore')
 
@@ -76,126 +72,127 @@ st.markdown("""
 # Initialize session state
 if 'db_initialized' not in st.session_state:
     st.session_state.db_initialized = False
-if 'profiles_table' not in st.session_state:
-    st.session_state.profiles_table = None
 if 'import_jobs' not in st.session_state:
     st.session_state.import_jobs = []
-if 'search_filters' not in st.session_state:
-    st.session_state.search_filters = {}
 
 class DataWarehouse:
-    """Core data warehouse using DuckDB for analytics and SQLite for search"""
+    """Core data warehouse using SQLite for storage and search"""
     
-    def __init__(self, db_path: str = "data_warehouse.duckdb", search_path: str = "search_index.db"):
+    def __init__(self, db_path: str = "data_warehouse.db"):
         self.db_path = db_path
-        self.search_path = search_path
         self.conn = None
-        self.search_conn = None
-        self._initialize_databases()
+        self._initialize_database()
     
-    def _initialize_databases(self):
-        """Initialize DuckDB and SQLite databases with proper schemas"""
+    def _initialize_database(self):
+        """Initialize SQLite database with proper schemas"""
         
-        # DuckDB for main data storage and analytics
-        self.conn = duckdb.connect(self.db_path)
+        # Main SQLite database for profiles
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA cache_size=-20000")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         
         # Create profiles table with all required fields
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS profiles (
-                profile_id VARCHAR PRIMARY KEY,
-                mobile VARCHAR(10) UNIQUE,
-                secondary_mobile VARCHAR(10),
-                name VARCHAR(500),
-                first_name VARCHAR(200),
-                last_name VARCHAR(200),
-                email VARCHAR(500),
+                profile_id TEXT PRIMARY KEY,
+                mobile TEXT UNIQUE,
+                secondary_mobile TEXT,
+                name TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                email TEXT,
                 address TEXT,
-                sub_locality VARCHAR(200),
-                area VARCHAR(200),
-                city VARCHAR(100),
-                state VARCHAR(100),
-                pincode VARCHAR(10),
-                zone VARCHAR(100),
-                gender VARCHAR(20),
+                sub_locality TEXT,
+                area TEXT,
+                city TEXT,
+                state TEXT,
+                pincode TEXT,
+                zone TEXT,
+                gender TEXT,
                 age INTEGER,
-                age_group VARCHAR(50),
-                income_group VARCHAR(100),
-                bhk_preference VARCHAR(50),
-                budget_range VARCHAR(100),
-                project_enquired VARCHAR(500),
-                lead_source VARCHAR(200),
-                company_name VARCHAR(500),
-                business_category VARCHAR(200),
-                vehicle_info VARCHAR(200),
-                date_collected DATE,
-                classification VARCHAR(50),
-                classification_confidence FLOAT,
-                created_at TIMESTAMP,
-                last_enriched TIMESTAMP,
-                is_active BOOLEAN DEFAULT TRUE,
-                has_valid_mobile BOOLEAN DEFAULT TRUE,
+                age_group TEXT,
+                income_group TEXT,
+                bhk_preference TEXT,
+                budget_range TEXT,
+                project_enquired TEXT,
+                lead_source TEXT,
+                company_name TEXT,
+                business_category TEXT,
+                vehicle_info TEXT,
+                date_collected TEXT,
+                classification TEXT,
+                classification_confidence REAL,
+                created_at TEXT,
+                last_enriched TEXT,
+                is_active INTEGER DEFAULT 1,
+                has_valid_mobile INTEGER DEFAULT 1,
                 record_count INTEGER DEFAULT 1,
                 source_files TEXT,
-                field_lineage TEXT,
-                raw_data TEXT
+                field_lineage TEXT
             )
         """)
+        
+        # Create indexes for fast searching
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_mobile ON profiles(mobile)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_city ON profiles(city)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_classification ON profiles(classification)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_name ON profiles(name)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_pincode ON profiles(pincode)")
         
         # Create field history table for audit trail
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS field_history (
-                history_id INTEGER PRIMARY KEY,
-                profile_id VARCHAR,
-                field_name VARCHAR,
+                history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id TEXT,
+                field_name TEXT,
                 old_value TEXT,
                 new_value TEXT,
-                source_file VARCHAR,
-                changed_at TIMESTAMP,
-                change_type VARCHAR(50),
-                data_type VARCHAR(20)  -- ACTUAL or INFERRED
+                source_file TEXT,
+                changed_at TEXT,
+                change_type TEXT,
+                data_type TEXT
             )
         """)
         
         # Create import jobs table
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS import_jobs (
-                job_id VARCHAR PRIMARY KEY,
-                file_name VARCHAR,
-                source_type VARCHAR,
-                collection_date DATE,
-                category VARCHAR,
-                geographic_coverage VARCHAR,
+                job_id TEXT PRIMARY KEY,
+                file_name TEXT,
+                source_type TEXT,
+                collection_date TEXT,
+                category TEXT,
+                geographic_coverage TEXT,
                 quality_notes TEXT,
-                file_label VARCHAR,
-                status VARCHAR,
+                file_label TEXT,
+                status TEXT,
                 total_records INTEGER,
                 processed_records INTEGER,
                 profiles_created INTEGER,
                 profiles_enriched INTEGER,
                 invalid_mobiles INTEGER,
-                started_at TIMESTAMP,
-                completed_at TIMESTAMP
+                started_at TEXT,
+                completed_at TEXT
             )
         """)
         
         # Create unknown fields storage
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS unknown_fields (
-                id INTEGER PRIMARY KEY,
-                profile_id VARCHAR,
-                field_name VARCHAR,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id TEXT,
+                field_name TEXT,
                 field_value TEXT,
-                source_file VARCHAR,
-                imported_at TIMESTAMP
+                source_file TEXT,
+                imported_at TEXT
             )
         """)
         
-        # SQLite for full-text search
-        self.search_conn = sqlite3.connect(self.search_path)
-        self.search_conn.execute("""
+        # Create full-text search virtual table
+        self.conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS profile_search USING fts5(
-                profile_id, mobile, name, email, address, city, area, pincode,
-                content=profiles
+                profile_id, mobile, name, email, address, city, area, pincode
             )
         """)
         
@@ -238,14 +235,12 @@ class DataWarehouse:
     
     def infer_location(self, pincode: str = None, city: str = None, area: str = None, address: str = None) -> Dict:
         """Infer location fields from partial information"""
-        # This would be backed by a comprehensive Indian geography database
-        # For now, returns placeholder inference logic
         result = {
             'city': None, 'state': None, 'pincode': None, 'area': None,
             'is_inferred': False, 'confidence': 'LOW'
         }
         
-        # Pincode to city/state mapping (sample - would be complete database)
+        # Pincode to city/state mapping (sample - expand as needed)
         pincode_map = {
             '411001': {'city': 'Pune', 'state': 'Maharashtra', 'area': 'Shivajinagar'},
             '411002': {'city': 'Pune', 'state': 'Maharashtra', 'area': 'Koregaon Park'},
@@ -255,6 +250,11 @@ class DataWarehouse:
             '411045': {'city': 'Pune', 'state': 'Maharashtra', 'area': 'Hinjewadi'},
             '400001': {'city': 'Mumbai', 'state': 'Maharashtra', 'area': 'Fort'},
             '400002': {'city': 'Mumbai', 'state': 'Maharashtra', 'area': 'Churchgate'},
+            '400020': {'city': 'Mumbai', 'state': 'Maharashtra', 'area': 'Powai'},
+            '400093': {'city': 'Mumbai', 'state': 'Maharashtra', 'area': 'Andheri East'},
+            '560001': {'city': 'Bangalore', 'state': 'Karnataka', 'area': 'MG Road'},
+            '560002': {'city': 'Bangalore', 'state': 'Karnataka', 'area': 'Indiranagar'},
+            '560038': {'city': 'Bangalore', 'state': 'Karnataka', 'area': 'Koramangala'},
         }
         
         if pincode and pincode in pincode_map:
@@ -301,11 +301,16 @@ class DataWarehouse:
         """Merge new data into existing profile with conflict resolution"""
         
         # Get current profile
-        current = self.conn.execute(f"SELECT * FROM profiles WHERE profile_id = '{profile_id}'").fetchone()
-        if not current:
+        cursor = self.conn.execute("SELECT * FROM profiles WHERE profile_id = ?", (profile_id,))
+        row = cursor.fetchone()
+        if not row:
             return False
         
-        current_dict = dict(zip([desc[0] for desc in self.conn.description], current))
+        # Get column names
+        columns = [description[0] for description in cursor.description]
+        current_dict = dict(zip(columns, row))
+        
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         # Fields to merge with conflict resolution
         fields_to_merge = ['name', 'email', 'address', 'city', 'area', 'pincode', 
@@ -318,28 +323,25 @@ class DataWarehouse:
             if new_value and not current_value:
                 # Empty field - fill it
                 self.conn.execute(f"""
-                    UPDATE profiles SET {field} = ?, last_enriched = NOW() 
+                    UPDATE profiles SET {field} = ?, last_enriched = ? 
                     WHERE profile_id = ?
-                """, (new_value, profile_id))
+                """, (new_value, now, profile_id))
                 
                 # Log to field history
                 self.conn.execute("""
                     INSERT INTO field_history (profile_id, field_name, old_value, new_value, source_file, changed_at, change_type, data_type)
-                    VALUES (?, ?, ?, ?, ?, NOW(), 'CREATE', ?)
-                """, (profile_id, field, None, new_value, source_file, data_type))
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (profile_id, field, None, new_value, source_file, now, 'CREATE', data_type))
                 
-            elif new_value and current_value and new_value != current_value:
-                # Conflict - resolve by rules
-                
-                # Rule 1: Longer value wins for names
-                if field == 'name' and len(new_value) > len(current_value):
-                    self.conn.execute(f"UPDATE profiles SET {field} = ?, last_enriched = NOW() WHERE profile_id = ?", (new_value, profile_id))
-                    self.conn.execute("INSERT INTO field_history VALUES (?, ?, ?, ?, ?, NOW(), 'CONFLICT_RESOLVED', ?)", 
-                                    (profile_id, field, current_value, new_value, source_file, data_type))
-                
-                # Rule 2: More recent wins (handled by data_type flag)
-                elif data_type == 'ACTUAL' and current_dict.get(f'_{field}_data_type') == 'INFERRED':
-                    self.conn.execute(f"UPDATE profiles SET {field} = ?, last_enriched = NOW() WHERE profile_id = ?", (new_value, profile_id))
+            elif new_value and current_value and str(new_value) != str(current_value):
+                # Conflict - longer value wins for names
+                if field == 'name' and len(str(new_value)) > len(str(current_value)):
+                    self.conn.execute(f"UPDATE profiles SET {field} = ?, last_enriched = ? WHERE profile_id = ?", 
+                                    (new_value, now, profile_id))
+                    self.conn.execute("""
+                        INSERT INTO field_history (profile_id, field_name, old_value, new_value, source_file, changed_at, change_type, data_type)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (profile_id, field, current_value, new_value, source_file, now, 'CONFLICT_RESOLVED', data_type))
         
         # Update record count and source files
         record_count = current_dict.get('record_count', 0) + 1
@@ -348,10 +350,11 @@ class DataWarehouse:
             source_files = f"{source_files},{source_file}" if source_files else source_file
         
         self.conn.execute("""
-            UPDATE profiles SET record_count = ?, source_files = ?, last_enriched = NOW() 
+            UPDATE profiles SET record_count = ?, source_files = ?, last_enriched = ? 
             WHERE profile_id = ?
-        """, (record_count, source_files, profile_id))
+        """, (record_count, source_files, now, profile_id))
         
+        self.conn.commit()
         return True
     
     def create_profile(self, record: Dict, source_file: str, source_type: str, category: str, data_type: str = 'ACTUAL') -> str:
@@ -374,13 +377,22 @@ class DataWarehouse:
             classification = category
             confidence = 1.0
         
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        date_collected = record.get('date_collected', datetime.now().date())
+        if isinstance(date_collected, datetime):
+            date_collected = date_collected.strftime("%Y-%m-%d")
+        elif isinstance(date_collected, str):
+            pass
+        else:
+            date_collected = date_collected.strftime("%Y-%m-%d")
+        
         # Insert profile
         self.conn.execute("""
             INSERT INTO profiles (
                 profile_id, mobile, name, email, address, city, area, pincode,
                 classification, classification_confidence, created_at, last_enriched,
                 record_count, source_files, has_valid_mobile, date_collected
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), 1, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             profile_id, mobile, 
             record.get('name'), record.get('email'), record.get('address'),
@@ -388,17 +400,19 @@ class DataWarehouse:
             location.get('area') or record.get('area'),
             record.get('pincode') or location.get('pincode'),
             classification, confidence,
-            source_file, is_valid, record.get('date_collected', datetime.now().date())
+            now, now,
+            1, source_file, 1 if is_valid else 0, date_collected
         ))
         
         # Update search index
-        self.search_conn.execute("""
+        self.conn.execute("""
             INSERT INTO profile_search (profile_id, mobile, name, email, address, city, area, pincode)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (profile_id, mobile, record.get('name'), record.get('email'), 
-              record.get('address'), location.get('city'), location.get('area'), record.get('pincode')))
+              record.get('address'), location.get('city') or record.get('city'), 
+              location.get('area') or record.get('area'), record.get('pincode')))
         
-        self.search_conn.commit()
+        self.conn.commit()
         
         return profile_id
     
@@ -452,19 +466,22 @@ class DataWarehouse:
                     result['invalid_mobiles'] += 1
                     continue
                 
-                # Build record dict
+                # Build record dict - try common column names
                 record = {
                     'mobile': mobile,
-                    'name': row.get('name', row.get('Name', row.get('NAME', ''))),
-                    'email': row.get('email', row.get('Email', row.get('EMAIL', ''))),
-                    'address': row.get('address', row.get('Address', row.get('ADDRESS', ''))),
-                    'city': row.get('city', row.get('City', row.get('CITY', ''))),
-                    'pincode': row.get('pincode', row.get('Pincode', row.get('PINCODE', ''))),
-                    'date_collected': metadata.get('collection_date', datetime.now().date())
+                    'name': row.get('name') or row.get('Name') or row.get('NAME') or row.get('full_name') or '',
+                    'email': row.get('email') or row.get('Email') or row.get('EMAIL') or '',
+                    'address': row.get('address') or row.get('Address') or row.get('ADDRESS') or '',
+                    'city': row.get('city') or row.get('City') or row.get('CITY') or '',
+                    'pincode': str(row.get('pincode') or row.get('Pincode') or row.get('PINCODE') or ''),
+                    'bhk_preference': row.get('bhk') or row.get('BHK') or row.get('preference') or '',
+                    'budget_range': row.get('budget') or row.get('Budget') or row.get('price_range') or '',
+                    'date_collected': metadata.get('collection_date', datetime.now().strftime("%Y-%m-%d"))
                 }
                 
                 # Check if profile exists
-                existing = self.conn.execute(f"SELECT profile_id FROM profiles WHERE mobile = '{mobile}'").fetchone()
+                cursor = self.conn.execute("SELECT profile_id FROM profiles WHERE mobile = ?", (mobile,))
+                existing = cursor.fetchone()
                 
                 if existing:
                     # Enrich existing profile
@@ -484,45 +501,70 @@ class DataWarehouse:
             
             # Store import job
             job_id = hashlib.md5(f"{file_obj.name}{datetime.now()}".encode()).hexdigest()[:8]
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
             self.conn.execute("""
-                INSERT INTO import_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+                INSERT INTO import_jobs VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
             """, (job_id, file_obj.name, metadata.get('source_type'), metadata.get('collection_date'),
                   metadata.get('category'), metadata.get('geographic_coverage'), metadata.get('quality_notes'),
                   metadata.get('file_label'), 'COMPLETE', result['total_records'], result['total_records'],
-                  result['profiles_created'], result['profiles_enriched'], result['invalid_mobiles']))
+                  result['profiles_created'], result['profiles_enriched'], result['invalid_mobiles'],
+                  now, now))
+            
+            self.conn.commit()
             
         except Exception as e:
             result['message'] = f"Error: {str(e)}"
         
         return result
     
-    def search(self, query: str = None, filters: Dict = None, limit: int = 100) -> pd.DataFrame:
+    def search(self, query: str = None, filters: Dict = None, limit: int = 1000) -> pd.DataFrame:
         """Search profiles with filters"""
         
-        sql = "SELECT * FROM profiles WHERE is_active = TRUE"
+        sql = "SELECT * FROM profiles WHERE is_active = 1"
+        params = []
         
         if query:
             # Use FTS for text search
-            fts_results = self.search_conn.execute("""
-                SELECT profile_id FROM profile_search WHERE profile_search MATCH ?
-            """, (query,)).fetchall()
-            
-            if fts_results:
-                profile_ids = [r[0] for r in fts_results]
-                sql += f" AND profile_id IN ({','.join([f"'{pid}'" for pid in profile_ids])})"
+            try:
+                fts_results = self.conn.execute("""
+                    SELECT profile_id FROM profile_search WHERE profile_search MATCH ?
+                    LIMIT 1000
+                """, (query,)).fetchall()
+                
+                if fts_results:
+                    profile_ids = [r[0] for r in fts_results]
+                    placeholders = ','.join(['?' for _ in profile_ids])
+                    sql += f" AND profile_id IN ({placeholders})"
+                    params.extend(profile_ids)
+                else:
+                    # Fallback to LIKE search
+                    search_pattern = f"%{query}%"
+                    sql += " AND (name LIKE ? OR mobile LIKE ? OR email LIKE ? OR city LIKE ? OR address LIKE ?)"
+                    params.extend([search_pattern, search_pattern, search_pattern, search_pattern, search_pattern])
+            except:
+                # Fallback to LIKE search
+                search_pattern = f"%{query}%"
+                sql += " AND (name LIKE ? OR mobile LIKE ? OR email LIKE ? OR city LIKE ? OR address LIKE ?)"
+                params.extend([search_pattern, search_pattern, search_pattern, search_pattern, search_pattern])
         
         # Apply filters
         if filters:
             if filters.get('classification'):
-                sql += f" AND classification = '{filters['classification']}'"
+                sql += " AND classification = ?"
+                params.append(filters['classification'])
             if filters.get('city'):
-                sql += f" AND city = '{filters['city']}'"
-            if filters.get('source_type'):
-                sql += f" AND source_files LIKE '%{filters['source_type']}%'"
+                sql += " AND city = ?"
+                params.append(filters['city'])
+            if filters.get('pincode'):
+                sql += " AND pincode = ?"
+                params.append(filters['pincode'])
         
         sql += f" LIMIT {limit}"
         
-        result = self.conn.execute(sql).fetchdf()
+        result = pd.read_sql_query(sql, self.conn, params=params)
         return result
     
     def get_statistics(self) -> Dict:
@@ -531,13 +573,13 @@ class DataWarehouse:
         stats = self.conn.execute("""
             SELECT 
                 COUNT(*) as total_profiles,
-                COUNT(CASE WHEN has_valid_mobile = TRUE THEN 1 END) as valid_mobiles,
-                COUNT(CASE WHEN classification = 'Real Estate Trade' THEN 1 END) as trade_count,
-                COUNT(CASE WHEN classification = 'Property Seeker' THEN 1 END) as seeker_count,
-                COUNT(CASE WHEN classification = 'Non-Real Estate' THEN 1 END) as nonre_count,
+                SUM(CASE WHEN has_valid_mobile = 1 THEN 1 ELSE 0 END) as valid_mobiles,
+                SUM(CASE WHEN classification = 'Real Estate Trade' THEN 1 ELSE 0 END) as trade_count,
+                SUM(CASE WHEN classification = 'Property Seeker' THEN 1 ELSE 0 END) as seeker_count,
+                SUM(CASE WHEN classification = 'Non-Real Estate' THEN 1 ELSE 0 END) as nonre_count,
                 SUM(record_count) as total_records
             FROM profiles
-            WHERE is_active = TRUE
+            WHERE is_active = 1
         """).fetchone()
         
         # City breakdown
@@ -548,16 +590,26 @@ class DataWarehouse:
             GROUP BY city 
             ORDER BY count DESC 
             LIMIT 10
-        """).fetchdf()
+        """).fetchall()
+        
+        # Source breakdown
+        source_stats = self.conn.execute("""
+            SELECT source_type, COUNT(*) as count 
+            FROM import_jobs 
+            GROUP BY source_type 
+            ORDER BY count DESC 
+            LIMIT 10
+        """).fetchall()
         
         return {
-            'total_profiles': stats[0],
-            'valid_mobiles': stats[1],
-            'trade_count': stats[2],
-            'seeker_count': stats[3],
-            'nonre_count': stats[4],
-            'total_records': stats[5],
-            'city_breakdown': city_stats.to_dict('records') if not city_stats.empty else []
+            'total_profiles': stats[0] or 0,
+            'valid_mobiles': stats[1] or 0,
+            'trade_count': stats[2] or 0,
+            'seeker_count': stats[3] or 0,
+            'nonre_count': stats[4] or 0,
+            'total_records': stats[5] or 0,
+            'city_breakdown': [{'city': row[0], 'count': row[1]} for row in city_stats],
+            'source_breakdown': [{'source': row[0], 'count': row[1]} for row in source_stats]
         }
 
 def main():
@@ -789,19 +841,28 @@ def dashboard_page(warehouse: DataWarehouse):
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No city data available")
+    
+    # Source breakdown
+    st.subheader("Data Sources")
+    if stats['source_breakdown']:
+        source_df = pd.DataFrame(stats['source_breakdown'])
+        fig = px.bar(source_df, x='source', y='count', title='Records by Source', color='count')
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No source data available")
 
 def history_page(warehouse: DataWarehouse):
     """Import history"""
     st.header("📋 Import History")
     
-    history = warehouse.conn.execute("""
+    history = pd.read_sql_query("""
         SELECT file_name, source_type, collection_date, category, 
                total_records, profiles_created, profiles_enriched, 
                invalid_mobiles, status, started_at
         FROM import_jobs 
         ORDER BY started_at DESC 
         LIMIT 50
-    """).fetchdf()
+    """, warehouse.conn)
     
     if not history.empty:
         st.dataframe(history, use_container_width=True)
@@ -820,15 +881,21 @@ def settings_page():
     st.markdown("""
     ### System Configuration
     
-    **Database Location:** `data_warehouse.duckdb`
-    **Search Index:** `search_index.db`
+    **Database Location:** `data_warehouse.db`
     
     ### Data Rules
     
     - Mobile numbers are standardized to 10 digits
     - Duplicate detection uses mobile number as primary key
-    - Field conflicts resolved by: longer values win, more recent wins
+    - Field conflicts resolved by: longer values win
     - Classification is automatic (can be overridden at import)
+    
+    ### Location Inference
+    
+    The system maintains a database of Indian pincodes to automatically infer:
+    - City from pincode
+    - State from pincode
+    - Area from pincode
     
     ### Export Settings
     
@@ -838,8 +905,8 @@ def settings_page():
     ### About
     
     **Version:** 2.0 (Enterprise Scale)
-    **Architecture:** DuckDB + SQLite FTS5
-    **Scale Ready:** 5 crore+ records
+    **Architecture:** SQLite with FTS5
+    **Scale Ready:** Designed for 5 crore+ records
     """)
 
 if __name__ == "__main__":
